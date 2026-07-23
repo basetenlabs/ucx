@@ -81,7 +81,16 @@ enum {
     UCP_PROTO_FLAG_PUT_SHORT = UCS_BIT(1), /* The protocol uses only uct_ep_put_short() */
     UCP_PROTO_FLAG_TAG_SHORT = UCS_BIT(2), /* The protocol uses only
                                               uct_ep_tag_eager_short() */
-    UCP_PROTO_FLAG_INVALID   = UCS_BIT(3)  /* The protocol is a placeholder */
+    UCP_PROTO_FLAG_INVALID   = UCS_BIT(3), /* The protocol is a placeholder */
+    UCP_PROTO_FLAG_RESEND_RECONFIG = UCS_BIT(4) /* Restart the protocol's
+                                                   requests when the endpoint
+                                                   reconfigures after a lane
+                                                   failure, even if they are
+                                                   not pending on any lane
+                                                   (e.g. an AM rendezvous RTS
+                                                   waiting for ATS whose
+                                                   control message may have
+                                                   been lost with the lane) */
 };
 
 

@@ -1980,6 +1980,46 @@ done:
     return ret;
 }
 
+#define UCP_EP_FAILOVER_MAX_RESEND 128
+/* Restart tracked requests that opted into resend-on-reconfig
+ * (UCP_PROTO_FLAG_RESEND_RECONFIG). Such requests wait for a remote reply
+ * and are not pending on any lane, so the pending-queue replay never
+ * restarts them; if their control message (or its reply) was lost with a
+ * failed lane, they would wait forever. Restarting resends the control
+ * message on the surviving lanes; protocols set the flag only when a
+ * duplicate delivery is safe. */
+static void ucp_ep_failover_resend_reqs(ucp_ep_h ucp_ep)
+{
+    ucp_request_t *resend_reqs[UCP_EP_FAILOVER_MAX_RESEND];
+    unsigned num_resend = 0;
+    ucp_request_t *req;
+    unsigned i;
+
+    ucs_hlist_for_each(req, &ucp_ep->ext->proto_reqs, send.list) {
+        if (!(req->flags & UCP_REQUEST_FLAG_PROTO_SEND) ||
+            !(req->send.proto_config->proto->flags &
+              UCP_PROTO_FLAG_RESEND_RECONFIG)) {
+            continue;
+        }
+
+        if (num_resend >= UCP_EP_FAILOVER_MAX_RESEND) {
+            ucs_diag("ep %p: too many requests to resend on reconfig, "
+                     "the remainder will resend on the next reconfiguration",
+                     ucp_ep);
+            break;
+        }
+
+        resend_reqs[num_resend++] = req;
+    }
+
+    /* Restart outside the iteration: a restart can synchronously complete
+     * the request and unlink it from the tracked-requests list. */
+    for (i = 0; i < num_resend; ++i) {
+        ucp_trace_req(resend_reqs[i], "resend on failover reconfig");
+        ucp_proto_request_restart(resend_reqs[i]);
+    }
+}
+
 ucs_status_t
 ucp_ep_failover_reconfig(ucp_ep_h ucp_ep, ucp_lane_map_t failed_lanes,
                          ucs_status_t discard_status)
@@ -2000,8 +2040,10 @@ ucp_ep_failover_reconfig(ucp_ep_h ucp_ep, ucp_lane_map_t failed_lanes,
     }
 
     ucp_ep_discard_lanes(ucp_ep, failed_lanes, discard_status, old_cfg_index);
+    ucp_ep_failover_resend_reqs(ucp_ep);
     return ucp_ep_recovery_arm(ucp_ep);
 }
+
 
 void ucp_ep_set_lanes_failed(ucp_ep_h ucp_ep, ucp_lane_map_t lanes,
                                      ucs_status_t status)

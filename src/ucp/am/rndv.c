@@ -72,7 +72,15 @@ static void ucp_am_rndv_rts_probe(const ucp_proto_init_params_t *init_params)
 ucp_proto_t ucp_am_rndv_proto = {
     .name     = "am/rndv",
     .desc     = NULL,
-    .flags    = 0,
+    /* RESEND_RECONFIG: an RTS waiting for ATS is not lane-pending, so a lane
+     * failure would otherwise strand it if the RTS (or the returning ATS) was
+     * lost with the lane. Restarting resends the RTS with a fresh request id;
+     * a duplicate delivery is benign for active messages - the receiver
+     * delivers the payload again (applications treat AM redeliveries as
+     * duplicates) and a stale ATS is dropped by the guarded id lookup.
+     * Deliberately NOT set for tag rendezvous: a duplicate tag RTS could
+     * match an unrelated posted receive. */
+    .flags    = UCP_PROTO_FLAG_RESEND_RECONFIG,
     .dt_mask  = UCP_PROTO_DT_MASK_DEFAULT,
     .probe    = ucp_am_rndv_rts_probe,
     .query    = ucp_proto_rndv_rts_query,
