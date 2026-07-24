@@ -449,6 +449,18 @@ static ucs_config_field_t ucp_context_config_table[] = {
    ucs_offsetof(ucp_context_config_t, recovery_retries),
    UCS_CONFIG_TYPE_UINT},
 
+  {"RECOVERY_TIMEOUT", "inf",
+   "Maximum wall-clock time an endpoint may stay unrecovered after a lane\n"
+   "failure before the process is aborted (inf - never abort). The timer\n"
+   "arms when the endpoint is first observed unrecovered and is cleared only\n"
+   "when a keepalive succeeds again, so it also fires for an endpoint that\n"
+   "keeps flapping or spins on a permanently unreachable peer (cases a finite\n"
+   "UCX_RECOVERY_RETRIES does not catch). Aborting lets an orchestrator\n"
+   "restart the worker. Applies only to keepalive-capable endpoints created\n"
+   "with UCP_ERR_HANDLING_MODE_FAILOVER.",
+   ucs_offsetof(ucp_context_config_t, recovery_timeout),
+   UCS_CONFIG_TYPE_TIME_UNITS},
+
   {"DYNAMIC_TL_SWITCH_INTERVAL", "inf",
    "Time interval between dynamic transport switching rounds. Must be\n"
    "non-zero value. use 'inf' to disable this feature.",

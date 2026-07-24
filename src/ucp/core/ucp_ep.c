@@ -256,6 +256,7 @@ static ucp_ep_h ucp_ep_allocate(ucp_worker_h worker, const char *peer_name)
     ep->ext->remote_ep_id                 = UCS_PTR_MAP_KEY_INVALID;
     ep->ext->err_cb                       = NULL;
     ep->ext->close_req                    = NULL;
+    ep->ext->recovery_deadline            = 0;
 #if UCS_ENABLE_ASSERT
     ep->ext->ka_last_round                = 0;
 #endif
@@ -1909,6 +1910,42 @@ ucs_status_t ucp_ep_recovery_arm(ucp_ep_h ep)
     return UCS_OK;
 }
 
+void ucp_ep_recovery_watchdog(ucp_ep_h ep, int degraded)
+{
+    ucp_context_h context = ep->worker->context;
+    ucs_time_t timeout    = context->config.ext.recovery_timeout;
+    ucs_time_t now;
+
+    /* Scoped to keepalive-capable endpoints: a keepalive success is the only
+     * signal that clears the deadline (see below), so without it we could
+     * never distinguish a genuine recovery from a flap. */
+    if ((timeout == UCS_TIME_INFINITY) ||
+        (ucp_ep_config(ep)->key.keepalive_lane == UCP_NULL_LANE)) {
+        return;
+    }
+
+    if (!degraded) {
+        /* A keepalive just succeeded: the endpoint is genuinely reachable
+         * again, so disarm. Clearing here rather than on a cleared failed-lane
+         * mask is deliberate - a lane that keeps flapping (falsely reported
+         * recovered while its device is down) never passes keepalive, so its
+         * deadline correctly survives the flap and eventually fires. */
+        ep->ext->recovery_deadline = 0;
+        return;
+    }
+
+    now = ucs_get_time();
+    if (ep->ext->recovery_deadline == 0) {
+        ep->ext->recovery_deadline = now + timeout;
+        ucs_diag("ep %p: unrecovered, arming abort watchdog (%.1f s)", ep,
+                 ucs_time_to_sec(timeout));
+    } else if (now > ep->ext->recovery_deadline) {
+        ucs_fatal("ep %p: endpoint unrecoverable for %.1f s "
+                  "(UCX_RECOVERY_TIMEOUT); aborting process for restart", ep,
+                  ucs_time_to_sec(timeout));
+    }
+}
+
 int ucp_ep_recovery_progress(ucp_ep_h ep)
 {
     ucp_worker_h worker = ep->worker;
@@ -1934,6 +1971,10 @@ int ucp_ep_recovery_progress(ucp_ep_h ep)
         ucs_assert(ep->ext->recovery_arg == NULL);
         goto done;
     }
+
+    /* Endpoint is under recovery this round (failed lanes still outstanding);
+     * arm/check the abort watchdog. A keepalive success (below) clears it. */
+    ucp_ep_recovery_watchdog(ep, 1);
 
     ucs_assert(ep->ext->recovery_arg != NULL);
     ucs_assert(ep->ext->recovery_arg->retries_left > 0);

@@ -3606,9 +3606,15 @@ static int ucp_worker_do_ep_keepalive(ucp_worker_h worker, ucs_time_t now)
     } else if (UCS_STATUS_IS_ERR(status)) {
         ucs_diag("worker %p: keepalive failed on ep %p lane[%d]=%p: %s", worker,
                  ep, lane, uct_ep, ucs_status_string(status));
+        /* Endpoint reachable check failed: arm/check the abort watchdog so an
+         * ep that keeps failing keepalive (flap or unreachable peer) does not
+         * spin forever under UCX_RECOVERY_RETRIES=inf. */
+        ucp_ep_recovery_watchdog(ep, 1);
     } else {
         ucs_trace("worker %p: keepalive done on ep %p lane[%d]=%p, now: <%lf"
                   " sec>", worker, ep, lane, uct_ep, ucs_time_to_sec(now));
+        /* Keepalive succeeded: the ep is genuinely reachable, disarm. */
+        ucp_ep_recovery_watchdog(ep, 0);
     }
 
 #if UCS_ENABLE_ASSERT

@@ -521,6 +521,10 @@ typedef struct ucp_ep_ext {
                                                     used by 2-stage ppln rndv proto */
     /* List of requests which are waiting for remote completion */
     ucs_hlist_head_t              proto_reqs;
+    ucs_time_t                    recovery_deadline; /* UCX_RECOVERY_TIMEOUT abort
+                                                        deadline; 0 while the ep is
+                                                        healthy, armed when it goes
+                                                        unrecovered under failover */
 #if UCS_ENABLE_ASSERT
     ucs_time_t                    ka_last_round; /* Time of last KA round done */
 #endif
@@ -1013,6 +1017,16 @@ ucs_status_t ucp_ep_recovery_arm(ucp_ep_h ep);
  *         other reason to skip keepalive round.
  */
 int ucp_ep_recovery_progress(ucp_ep_h ep);
+
+
+/**
+ * UCX_RECOVERY_TIMEOUT watchdog. Arms a wall-clock deadline the first time a
+ * failover endpoint is observed unrecovered (@a degraded != 0) and aborts the
+ * process once it expires while still unrecovered; a @a degraded == 0 call
+ * (a successful keepalive) clears the deadline. No-op unless the endpoint is
+ * keepalive-capable and UCX_RECOVERY_TIMEOUT is finite.
+ */
+void ucp_ep_recovery_watchdog(ucp_ep_h ep, int degraded);
 
 
 /**

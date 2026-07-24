@@ -187,6 +187,9 @@ typedef struct ucp_context_config {
     /** Maximal number of recovery rounds before the endpoint is declared
      *  fully failed. Must be non-zero. */
     unsigned                               recovery_retries;
+    /** Maximum wall-clock time a failover endpoint may stay unrecovered after
+     *  a lane failure before the process is aborted (inf - never abort). */
+    ucs_time_t                             recovery_timeout;
     /** Time period between dynamic transport switching rounds */
     ucs_time_t                             dynamic_tl_switch_interval;
     /** Number of usage tracker rounds performed for each progress operation */
