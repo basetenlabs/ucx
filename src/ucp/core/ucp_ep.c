@@ -2045,6 +2045,44 @@ ucp_ep_failover_reconfig(ucp_ep_h ucp_ep, ucp_lane_map_t failed_lanes,
 }
 
 
+/*
+ * When a lane fails under failover mode the whole physical device is down, so
+ * every other lane bound to that device is unusable too - even if no operation
+ * has erred on it yet. Expand the reported failed-lane mask to cover all
+ * co-located lanes (matched by device index, which is shared across transports
+ * on the same NIC) so that reconfiguration drops them together and re-selects
+ * their roles onto a surviving device. This matters most for the single
+ * rendezvous control lane (RTS/RTR/ATS/ATP): if it is left co-located with a
+ * failed data lane it keeps pointing at the dead device and all control
+ * messages hang, stranding the endpoint.
+ */
+static ucp_lane_map_t
+ucp_ep_failed_lanes_same_device(ucp_ep_h ucp_ep, ucp_lane_map_t lanes)
+{
+    ucp_context_h context = ucp_ep->worker->context;
+    ucp_lane_map_t result = lanes;
+    ucp_lane_index_t failed_lane, lane;
+    ucp_rsc_index_t failed_rsc, rsc;
+
+    ucs_for_each_bit(failed_lane, lanes) {
+        failed_rsc = ucp_ep_get_rsc_index(ucp_ep, failed_lane);
+        if (failed_rsc == UCP_NULL_RESOURCE) {
+            continue;
+        }
+
+        for (lane = 0; lane < ucp_ep_num_lanes(ucp_ep); ++lane) {
+            rsc = ucp_ep_get_rsc_index(ucp_ep, lane);
+            if ((rsc != UCP_NULL_RESOURCE) &&
+                (context->tl_rscs[rsc].dev_index ==
+                 context->tl_rscs[failed_rsc].dev_index)) {
+                result |= UCS_BIT(lane);
+            }
+        }
+    }
+
+    return result;
+}
+
 void ucp_ep_set_lanes_failed(ucp_ep_h ucp_ep, ucp_lane_map_t lanes,
                                      ucs_status_t status)
 {
@@ -2056,10 +2094,12 @@ void ucp_ep_set_lanes_failed(ucp_ep_h ucp_ep, ucp_lane_map_t lanes,
     ucs_assert(!ucs_async_is_from_async(&ucp_ep->worker->async));
 
     if (ucp_ep_err_mode_eq(ucp_ep, UCP_ERR_HANDLING_MODE_FAILOVER) &&
-        /* TODO refactor this to mark all lanes as failed */
         (lanes != 0) &&
          /* sockaddr is not supported for failover mode */
         cm_lane == UCP_NULL_LANE) {
+        /* A failed device takes down all of its lanes together, including a
+         * rendezvous control lane that may not have erred on its own. */
+        lanes           = ucp_ep_failed_lanes_same_device(ucp_ep, lanes);
         reconfig_status = ucp_ep_failover_reconfig(ucp_ep, lanes, status);
         if (reconfig_status == UCS_OK) {
             return;
