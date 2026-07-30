@@ -10,6 +10,7 @@
 #include <string>
 
 extern "C" {
+#include <ucp/core/ucp_ep.h>
 #include <ucp/core/ucp_ep.inl>
 #include <ucp/core/ucp_context.h>
 #include <ucp/wireup/wireup_ep.h>
@@ -71,17 +72,8 @@ protected:
 
     void init() override {
         if (get_variant_value() & TEST_OP_ALL_LANES_FAILED) {
-            /* Defer recovery so all per-lane invalidations accumulate as failed
-             * before recovery fires. Data-path transports detect the failure
-             * via transport completions, so a long defer is harmless. UD has no
-             * such data-path signal and relies on keepalive for detection, so a
-             * long defer would also defer the error callback (making the test
-             * run until the deadline). Use a short defer that still comfortably
-             * outlasts the (sub-second) invalidation loop. */
-            const std::string defer =
-                    has_any_transport({"ud_v", "ud_x"}) ?
-                    "3s" : std::to_string(ucs::test_timeout_in_sec) + "s";
-            modify_config("KEEPALIVE_INTERVAL", defer);
+            modify_config("RECOVERY_RETRIES", "1");
+            modify_config("KEEPALIVE_INTERVAL", std::to_string(3) + "s");
         }
 
         ucp_test::init();
@@ -452,25 +444,26 @@ protected:
                 EXPECT_EQ(UCS_OK, status) << op_str << " operation returned status: "
                                           << ucs_status_string(status);
                 ASSERT_EQ(0, m_total_err_count) << "Error callback invoked " << m_total_err_count << " times";
+            } else if ((failure_side == FAILURE_SIDE_TARGET) &&
+                       has_transport("dc_x")) {
+                /* DC cannot detect remote DCI failure (connect2iface); test limitation. */
+            } else if (status == UCS_OK) {
+                /* Some lanes recovered; EP still operable, no error callback required. */
             } else {
-                // The last lane is expected to fail
-                short_progress_loop();
-                if ((failure_side == FAILURE_SIDE_TARGET) &&
-                    has_transport("dc_x")) {
-                    // DC transport is not able to detect failure of remote DCI since DC is a connect2iface transport.
-                    // This is a test limitation.
-                } else {
-                    ucs_time_t deadline = ucs::get_deadline();
-                    while ((m_initiator_err_count == 0) && (ucs_get_time() < deadline)) {
-                        short_progress_loop();
-                    }
-
-                    // Initiator EP should invoke error callback only once
-                    ASSERT_EQ(1, m_initiator_err_count) << "Error callback invoked " << m_initiator_err_count << " times";
-                    // Remote side may detect failure by keepalive or other control messages but not more than 1 time
-                    ASSERT_LE(m_total_err_count - m_initiator_err_count, 1)
-                            << "Error callback invoked " << m_total_err_count << " times";
+                /* Operation failed => EP must fail with exactly one initiator err CB. */
+                ucs_time_t deadline = ucs::get_deadline();
+                while ((m_initiator_err_count == 0) &&
+                       (ucs_get_time() < deadline)) {
+                    short_progress_loop();
                 }
+
+                ASSERT_EQ(1, m_initiator_err_count)
+                        << "Error callback invoked " << m_initiator_err_count
+                        << " times";
+                /* Remote may detect failure via KA/control msgs, at most once. */
+                ASSERT_LE(m_total_err_count - m_initiator_err_count, 1)
+                        << "Error callback invoked " << m_total_err_count
+                        << " times";
             }
         }
 
@@ -618,7 +611,7 @@ protected:
 
         test_recovery(op_mask);
     }
-private:
+protected:
     static size_t rma_msg_size() {
         return ucs::limit_buffer_size((100 * UCS_MBYTE) / ucs::test_time_multiplier());
     }
@@ -764,7 +757,6 @@ protected:
     bool m_defer_rndv_recv = false;
     std::vector<deferred_rndv_t> m_deferred_rndv;
 
-protected:
     size_t m_initiator_err_count = 0;
     size_t m_total_err_count     = 0;
     ucs_status_t m_err_status    = UCS_OK;
@@ -788,7 +780,6 @@ UCS_TEST_P(test_ucp_fault_tolerance, target_failure, "MAX_EAGER_LANES=8",
 {
     do_test(FAILURE_SIDE_TARGET);
 }
-
 
 /**
  * Rendezvous fault injection under failover mode.
@@ -978,3 +969,37 @@ UCS_TEST_P(test_ucp_rndv_failover, concurrent_transfers_survive_lane_failure,
     run_rndv_with_injected_failure(8);
 }
 
+UCS_TEST_P(test_ucp_fault_tolerance, probe_gated_recovery, "MAX_EAGER_LANES=8",
+           "RECOVERY_RETRIES=100")
+{
+    bool probe_armed = false;
+
+    if ((get_variant_value() != TEST_OP_AM) ||
+        !has_any_transport({"rc_x", "rc_v", "rc_mlx5", "rc_verbs", "ib"})) {
+        UCS_TEST_SKIP_R("RC p2p AM variant only");
+    }
+
+    test_am_with_injected_failure(FAILURE_SIDE_TARGET, TEST_OP_AM);
+
+    wait_for_cond([this, &probe_armed]() {
+        ucp_ep_h ep = sender().ep(0, INJECTED_EP_INDEX);
+        ucp_ep_recovery_arg_t *arg = ep->ext->recovery_arg;
+        ucp_lane_index_t lane;
+
+        if (arg != NULL) {
+            for (lane = 0; lane < ucp_ep_num_lanes(ep); ++lane) {
+                if (arg->probe[lane].comp.func != NULL) {
+                    probe_armed = true;
+                    break;
+                }
+            }
+        }
+
+        return ucp_ep_get_failed_lanes(ep) == 0;
+    }, [this]() {
+        short_progress_loop();
+    });
+
+    EXPECT_TRUE(probe_armed)
+            << "RC p2p lane recovery completed without arming an aux probe";
+}
