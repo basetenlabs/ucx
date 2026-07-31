@@ -1098,6 +1098,62 @@ uint16_t uct_ib_iface_resolve_remote_flid(uct_ib_iface_t *iface,
     return uct_ib_iface_gid_extract_flid(gid);
 }
 
+/* On RoCE the GID table index of an address is not stable: deleting and
+ * re-adding the netdev IP (e.g. a NIC rail lost and later restored) re-creates
+ * the GID at a new index. The index cached in iface->gid_info at init then
+ * points to an empty or different slot, so every new connection built from
+ * this iface would carry an invalid source GID - and a recovered rail could
+ * never re-attach without a process restart. Before using the cached index
+ * for a new address handle, verify the slot still holds the cached GID value
+ * and RoCE version, and re-locate them in the table if not. */
+static void uct_ib_iface_roce_refresh_gid_index(uct_ib_iface_t *iface)
+{
+    uct_ib_device_t *dev = uct_ib_iface_device(iface);
+    uint8_t port_num     = iface->config.port_num;
+    int gid_tbl_len = uct_ib_device_port_attr(dev, port_num)->gid_tbl_len;
+    uct_ib_device_gid_info_t gid_info;
+    ucs_status_t status;
+    unsigned gid_index;
+
+    status = uct_ib_device_query_gid_info(dev->ibv_context,
+                                          uct_ib_device_name(dev), port_num,
+                                          iface->gid_info.gid_index, &gid_info);
+    if ((status == UCS_OK) &&
+        !memcmp(&gid_info.gid, &iface->gid_info.gid, sizeof(gid_info.gid)) &&
+        (gid_info.roce_info.ver == iface->gid_info.roce_info.ver)) {
+        /* Cached index still holds our GID */
+        return;
+    }
+
+    for (gid_index = 0; (int)gid_index < gid_tbl_len; ++gid_index) {
+        if (gid_index == iface->gid_info.gid_index) {
+            continue;
+        }
+
+        status = uct_ib_device_query_gid_info(dev->ibv_context,
+                                              uct_ib_device_name(dev),
+                                              port_num, gid_index, &gid_info);
+        if ((status != UCS_OK) ||
+            memcmp(&gid_info.gid, &iface->gid_info.gid, sizeof(gid_info.gid)) ||
+            (gid_info.roce_info.ver != iface->gid_info.roce_info.ver)) {
+            continue;
+        }
+
+        ucs_diag("iface %p: %s:%d gid moved from index %d to %d", iface,
+                 uct_ib_device_name(dev), port_num,
+                 iface->gid_info.gid_index, gid_index);
+        iface->gid_info.gid_index = gid_index;
+        return;
+    }
+
+    /* GID is currently absent from the table (rail still down): keep the
+     * cached index; connection attempts will fail and retry, and a later
+     * call re-scans once the address is restored. */
+    ucs_debug("iface %p: %s:%d gid not found in table, keeping index %d",
+              iface, uct_ib_device_name(dev), port_num,
+              iface->gid_info.gid_index);
+}
+
 ucs_status_t
 uct_ib_iface_fill_ah_attr_from_addr(uct_ib_iface_t *iface,
                                     const uct_ib_address_t *ib_addr,
@@ -1128,6 +1184,9 @@ uct_ib_iface_fill_ah_attr_from_addr(uct_ib_iface_t *iface,
     if (params.flags & UCT_IB_ADDRESS_PACK_FLAG_GID_INDEX) {
         ucs_assert(params.gid_index != UCT_IB_ADDRESS_INVALID_GID_INDEX);
     } else {
+        if (uct_ib_iface_is_roce(iface)) {
+            uct_ib_iface_roce_refresh_gid_index(iface);
+        }
         params.gid_index = iface->gid_info.gid_index;
     }
 
