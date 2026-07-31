@@ -1020,11 +1020,14 @@ int ucp_ep_recovery_progress(ucp_ep_h ep);
 
 
 /**
- * UCX_RECOVERY_TIMEOUT watchdog. Arms a wall-clock deadline the first time a
- * failover endpoint is observed unrecovered (@a degraded != 0) and aborts the
- * process once it expires while still unrecovered; a @a degraded == 0 call
- * (a successful keepalive) clears the deadline. No-op unless the endpoint is
- * keepalive-capable and UCX_RECOVERY_TIMEOUT is finite.
+ * UCX_RECOVERY_TIMEOUT watchdog. Arms a wall-clock deadline when a keepalive
+ * fails (@a degraded != 0), i.e. the peer is unreachable over the lanes the
+ * endpoint currently has, and aborts the process once the deadline expires
+ * while that is still true. A successful keepalive (@a degraded == 0) clears
+ * it. Losing lanes alone does NOT arm it: an endpoint that failed over onto
+ * surviving lanes and still reaches the peer is working, not failing.
+ * No-op unless the endpoint is keepalive-capable and UCX_RECOVERY_TIMEOUT is
+ * finite.
  */
 void ucp_ep_recovery_watchdog(ucp_ep_h ep, int degraded);
 

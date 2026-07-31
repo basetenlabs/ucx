@@ -3575,7 +3575,19 @@ static int ucp_worker_do_ep_keepalive(ucp_worker_h worker, ucs_time_t now)
         goto out_done;
     }
 
-    if (ucp_ep_recovery_progress(ep)) {
+    /* An endpoint under recovery is skipped only when nothing is left to probe.
+     * While it still has live lanes it is merely degraded - failover moved the
+     * traffic onto them - and it must keep being probed: a successful keepalive
+     * is what proves failover is working and disarms the UCX_RECOVERY_TIMEOUT
+     * watchdog, and a failing one is what arms it. Skipping the probe for every
+     * endpoint with an outstanding failed lane would make a healthy degraded
+     * endpoint look permanently unrecovered. */
+    if (ucp_ep_recovery_progress(ep) && (ucp_ep_get_live_lanes(ep) == 0)) {
+        /* No live lane left to probe, so failover has nothing to deliver on:
+         * that state is itself the abort condition. Keep driving the watchdog
+         * here - it is the only remaining caller, and without it an already
+         * armed deadline would never be re-evaluated. */
+        ucp_ep_recovery_watchdog(ep, 1);
         goto out_done;
     }
 

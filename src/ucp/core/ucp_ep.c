@@ -1916,20 +1916,22 @@ void ucp_ep_recovery_watchdog(ucp_ep_h ep, int degraded)
     ucs_time_t timeout    = context->config.ext.recovery_timeout;
     ucs_time_t now;
 
-    /* Scoped to keepalive-capable endpoints: a keepalive success is the only
-     * signal that clears the deadline (see below), so without it we could
-     * never distinguish a genuine recovery from a flap. */
+    /* Scoped to keepalive-capable endpoints: keepalive is the only signal this
+     * watchdog acts on - success clears the deadline, failure arms it - so
+     * without it we could not tell a working degraded endpoint from a dead
+     * one. */
     if ((timeout == UCS_TIME_INFINITY) ||
         (ucp_ep_config(ep)->key.keepalive_lane == UCP_NULL_LANE)) {
         return;
     }
 
     if (!degraded) {
-        /* A keepalive just succeeded: the endpoint is genuinely reachable
-         * again, so disarm. Clearing here rather than on a cleared failed-lane
-         * mask is deliberate - a lane that keeps flapping (falsely reported
-         * recovered while its device is down) never passes keepalive, so its
-         * deadline correctly survives the flap and eventually fires. */
+        /* A keepalive just succeeded: the peer is reachable over the lanes the
+         * endpoint has now, so failover is doing its job - disarm, even if some
+         * lanes are still marked failed (a rail that never comes back is not a
+         * reason to abort). Clearing on keepalive success rather than on a
+         * cleared failed-lane mask is deliberate: a flapping lane never passes
+         * keepalive, so its deadline correctly survives the flap. */
         ep->ext->recovery_deadline = 0;
         return;
     }
@@ -1972,9 +1974,11 @@ int ucp_ep_recovery_progress(ucp_ep_h ep)
         goto done;
     }
 
-    /* Endpoint is under recovery this round (failed lanes still outstanding);
-     * arm/check the abort watchdog. A keepalive success (below) clears it. */
-    ucp_ep_recovery_watchdog(ep, 1);
+    /* Deliberately NOT arming the abort watchdog here: outstanding failed
+     * lanes only mean the endpoint is degraded, and a degraded endpoint whose
+     * surviving lanes still reach the peer is exactly what failover is for.
+     * The watchdog is armed only by an actual keepalive failure, i.e. when the
+     * peer is unreachable over the lanes that remain. */
 
     ucs_assert(ep->ext->recovery_arg != NULL);
     ucs_assert(ep->ext->recovery_arg->retries_left > 0);

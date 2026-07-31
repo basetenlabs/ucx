@@ -450,12 +450,16 @@ static ucs_config_field_t ucp_context_config_table[] = {
    UCS_CONFIG_TYPE_UINT},
 
   {"RECOVERY_TIMEOUT", "inf",
-   "Maximum wall-clock time an endpoint may stay unrecovered after a lane\n"
-   "failure before the process is aborted (inf - never abort). The timer\n"
-   "arms when the endpoint is first observed unrecovered and is cleared only\n"
-   "when a keepalive succeeds again, so it also fires for an endpoint that\n"
-   "keeps flapping or spins on a permanently unreachable peer (cases a finite\n"
-   "UCX_RECOVERY_RETRIES does not catch). Aborting lets an orchestrator\n"
+   "Maximum wall-clock time an endpoint may stay unreachable before the\n"
+   "process is aborted (inf - never abort). The timer arms when a keepalive\n"
+   "fails, i.e. the peer cannot be reached over the lanes the endpoint has\n"
+   "left, and is cleared as soon as a keepalive succeeds again. Losing lanes\n"
+   "alone does not arm it: an endpoint that failed over onto surviving lanes\n"
+   "and still reaches the peer keeps running, however long the lost lanes\n"
+   "stay down. It therefore fires only when failover cannot deliver - a\n"
+   "permanently unreachable peer, or a flapping link that never sustains a\n"
+   "keepalive - cases a finite UCX_RECOVERY_RETRIES does not catch, since its\n"
+   "counter is reset by every fresh failure. Aborting lets an orchestrator\n"
    "restart the worker. Applies only to keepalive-capable endpoints created\n"
    "with UCP_ERR_HANDLING_MODE_FAILOVER.",
    ucs_offsetof(ucp_context_config_t, recovery_timeout),
