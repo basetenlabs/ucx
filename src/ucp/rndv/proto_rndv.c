@@ -557,6 +557,16 @@ void ucp_proto_rndv_rts_probe(const ucp_proto_init_params_t *init_params)
         .super.hdr_size      = 0,
         .super.send_op       = UCT_EP_OP_AM_BCOPY,
         .super.memtype_op    = UCT_EP_OP_LAST,
+        /* FAILOVER admits the rendezvous chain under
+         * UCP_ERR_HANDLING_MODE_FAILOVER, where it would otherwise be rejected
+         * and every large message would fall back to eager. What it buys is
+         * data-path recovery: a fetch or write that fails with a lane restarts
+         * on a surviving one. It does not make the control leg reliable - if
+         * the RTS itself (or its reply) is lost with the lane, the transfer
+         * waits for the application timeout, and recovering from that is the
+         * application's business: replaying an RTS here cannot be exactly-once,
+         * because the replay carries a new request id and the receive path has
+         * no duplicate check. */
         .super.flags         = UCP_PROTO_COMMON_INIT_FLAG_ERR_HANDLING |
                                UCP_PROTO_COMMON_INIT_FLAG_FAILOVER,
         .super.exclude_map   = 0,
