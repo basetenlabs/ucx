@@ -726,19 +726,16 @@ public:
         modify_config("RNDV_THRESH", "8k");
     }
 
-    void init() override {
-        /* Recovering a rendezvous transfer from a lane failure works on the
-         * mlx5 transports; elsewhere the transfer cannot be recovered, so its
-         * requests are still outstanding when the endpoint is destroyed and
-         * ucp_ep_destroy asserts the tracked-request list is empty (observed on
-         * ud_v, ud_x and rc_v). Skip rather than assert a capability the
-         * transport does not have - the eager fixture special-cases UD for the
-         * neighbouring ud_ep_purge assertion in the same spirit. */
-        if (!has_any_transport({"rc_x", "dc_x"})) {
-            UCS_TEST_SKIP_R("rendezvous failover recovery requires rc_mlx5 or "
-                            "dc_mlx5");
-        }
+    void cleanup() override {
+        /* A test that returns early - an ASSERT in the middle of the helper -
+         * would otherwise leave descriptors parked and their senders waiting,
+         * and ucp_ep_destroy asserts the tracked-request list is empty. */
+        drain_deferred_rndv_recvs();
+        flush_workers();
+        test_ucp_fault_tolerance::cleanup();
+    }
 
+    void init() override {
         test_ucp_fault_tolerance::init();
     }
 
@@ -769,12 +766,19 @@ protected:
      * and no reconfiguration happens, so the test would pass without
      * exercising anything. Leaving exactly one lane alive forces the roles on
      * the failed lanes to move there, which is the path under test. */
+    /* Fail a data lane only.
+     *
+     * A rendezvous transfer rides two lane sets: RTS/RTR/ATS take a single AM
+     * control lane, the payload takes the RMA BW lanes. Failover recovers the
+     * payload - a fetch restarts on a surviving lane - but does not replay a
+     * control message, so killing the AM lane strands the transfer until the
+     * application timeout whenever the control leg happened to be on it. A test
+     * that injected on both lane sets therefore passed or failed depending on
+     * which lane the control leg picked, and a stranded request then tripped
+     * the tracked-request assertion in ucp_ep_destroy.
+     *
+     * Failing only the data lanes tests exactly what admission promises. */
     void inject_am_lane_failures() {
-        /* A rendezvous transfer rides two lane sets: the RTS/ATS control
-         * messages take a single AM lane, the payload takes the RMA BW lanes.
-         * Both have to be hit, or the transfer completes on lanes that were
-         * never invalidated and no reconfiguration happens at all. */
-        inject_lane_group_failures(TEST_OP_AM, "AM");
         inject_lane_group_failures(TEST_OP_GET, "RMA BW");
     }
 
@@ -859,7 +863,11 @@ protected:
     }
 };
 
-UCP_INSTANTIATE_TEST_CASE(test_ucp_rndv_failover)
+/* RC and DC only: they carry the rendezvous protocols that failover admits. */
+UCP_INSTANTIATE_TEST_CASE_TLS(test_ucp_rndv_failover, rc,      "rc")
+UCP_INSTANTIATE_TEST_CASE_TLS(test_ucp_rndv_failover, rc_mlx5, "rc_mlx5")
+UCP_INSTANTIATE_TEST_CASE_TLS(test_ucp_rndv_failover, dc,      "dc")
+UCP_INSTANTIATE_TEST_CASE_TLS(test_ucp_rndv_failover, dc_mlx5, "dc_mlx5")
 
 /* Rendezvous must survive a lane failure at all - the case the eager-only
  * coverage left open. What failover admission buys is data-path recovery: a get

@@ -338,7 +338,7 @@ noinst_HEADERS = \
 	ucp/ucp_test.h \
 	ucp/ucp_datatype.h
 
-.PHONY: test test gdb valgrind test_separate fix_rpath ucx
+.PHONY: test test gdb valgrind test_separate test_by_suite fix_rpath ucx
 
 
 all-local: gtest
@@ -355,6 +355,7 @@ help:
 	@echo "  test_gdb      : Run unit tests with GDB."
 	@echo "  test_valgrind : Run unit tests with Valgrind."
 	@echo "  test_separate : Run each unit test in its own process."
+	@echo "  test_by_suite : Run each test suite in its own process."
 	@echo
 	@echo "Environment variables:"
 	@echo "  GTEST_FILTER        : Unit tests filter (\"$(GTEST_FILTER)\")"
@@ -383,6 +384,14 @@ test: ucx gtest
 test_separate: ucx gtest
 	$(LAUNCHER) env $(TEST_ENV) $(abs_srcdir)/run_tests_separately.sh \
 		-g $(abs_builddir)/gtest -f "$(GTEST_FILTER)"
+
+#
+# Same, but one process per suite. Startup dominates a single case, so this is
+# the cheaper way to keep suites from interfering with one another.
+#
+test_by_suite: ucx gtest
+	$(LAUNCHER) env $(TEST_ENV) $(abs_srcdir)/run_tests_separately.sh \
+		-g $(abs_builddir)/gtest -f "$(GTEST_FILTER)" -s
 
 #
 # Run unit tests with GDB
