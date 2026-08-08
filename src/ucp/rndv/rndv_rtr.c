@@ -243,7 +243,14 @@ static void ucp_proto_rndv_rtr_probe(const ucp_proto_init_params_t *init_params)
         .super.hdr_size      = sizeof(ucp_rndv_rtr_hdr_t),
         .super.send_op       = UCT_EP_OP_AM_BCOPY,
         .super.memtype_op    = UCT_EP_OP_LAST,
-        .super.flags         = UCP_PROTO_COMMON_INIT_FLAG_ERR_HANDLING,
+        /* As for the RTS probe: FAILOVER buys data-path recovery (a fenced
+         * write restarts on a surviving lane, and the reset rewinds to
+         * atp_count, so a re-write is idempotent while no ATP has been posted).
+         * The RTR/ATP control leg is not replayed - the reset releases the
+         * receive request id, so a resent RTR would orphan an in-flight ATP -
+         * hence losing RTR or ATP falls back to the application timeout. */
+        .super.flags         = UCP_PROTO_COMMON_INIT_FLAG_ERR_HANDLING |
+                               UCP_PROTO_COMMON_INIT_FLAG_FAILOVER,
         .super.exclude_map   = 0,
         .super.reg_mem_info  = ucp_proto_common_select_param_mem_info(
                                                      init_params->select_param),

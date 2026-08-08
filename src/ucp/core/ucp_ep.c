@@ -2014,10 +2014,15 @@ void ucp_ep_set_lanes_failed(ucp_ep_h ucp_ep, ucp_lane_map_t lanes,
     ucs_assert(!ucs_async_is_from_async(&ucp_ep->worker->async));
 
     if (ucp_ep_err_mode_eq(ucp_ep, UCP_ERR_HANDLING_MODE_FAILOVER) &&
-        /* TODO refactor this to mark all lanes as failed */
         (lanes != 0) &&
          /* sockaddr is not supported for failover mode */
         cm_lane == UCP_NULL_LANE) {
+        /* Only the lanes that actually erred are failed. A lane error is not
+         * evidence that its device is down - a QP can fail on its own - and
+         * condemning co-located lanes would turn one recoverable lane failure
+         * into an endpoint failure. When a device really is down, its other
+         * lanes err in turn and each reconfiguration moves the roles it
+         * carried, the rendezvous control lane included. */
         reconfig_status = ucp_ep_failover_reconfig(ucp_ep, lanes, status);
         if (reconfig_status == UCS_OK) {
             return;

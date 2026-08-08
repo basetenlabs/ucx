@@ -434,7 +434,8 @@ ucp_proto_rndv_put_zcopy_probe(const ucp_proto_init_params_t *init_params)
             init_params, UCS_BIT(UCP_RNDV_MODE_PUT_ZCOPY), SIZE_MAX,
             UCT_EP_OP_LAST,
             UCP_PROTO_COMMON_INIT_FLAG_SEND_ZCOPY |
-            UCP_PROTO_COMMON_INIT_FLAG_ERR_HANDLING,
+            UCP_PROTO_COMMON_INIT_FLAG_ERR_HANDLING |
+            UCP_PROTO_COMMON_INIT_FLAG_FAILOVER,
             0, ucp_proto_rndv_put_zcopy_completion, 0,
             UCP_WORKER_STAT_RNDV_PUT_ZCOPY, &reg_mem_info);
 }

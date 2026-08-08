@@ -56,7 +56,8 @@ noinst_PROGRAMS = gtest
 
 EXTRA_DIST = \
 	ucs/ucx.conf \
-	ucs/ucx_test.conf
+	ucs/ucx_test.conf \
+	run_tests_separately.sh
 
 gtestdir  = $(includedir)
 gtest_LDADD = \
@@ -337,7 +338,7 @@ noinst_HEADERS = \
 	ucp/ucp_test.h \
 	ucp/ucp_datatype.h
 
-.PHONY: test test gdb valgrind fix_rpath ucx
+.PHONY: test test gdb valgrind test_separate test_by_suite fix_rpath ucx
 
 
 all-local: gtest
@@ -353,6 +354,8 @@ help:
 	@echo "  test          : Run unit tests."
 	@echo "  test_gdb      : Run unit tests with GDB."
 	@echo "  test_valgrind : Run unit tests with Valgrind."
+	@echo "  test_separate : Run each unit test in its own process."
+	@echo "  test_by_suite : Run each test suite in its own process."
 	@echo
 	@echo "Environment variables:"
 	@echo "  GTEST_FILTER        : Unit tests filter (\"$(GTEST_FILTER)\")"
@@ -373,6 +376,22 @@ list: gtest
 test: ucx gtest
 	@rm -f core.*
 	$(LAUNCHER) env $(TEST_ENV) stdbuf -e0 -o0 $(abs_builddir)/gtest $(GTEST_ARGS)
+
+#
+# Run each unit test in its own process, so that a case which aborts fails only
+# itself instead of truncating the run, and cases cannot affect one another.
+#
+test_separate: ucx gtest
+	$(LAUNCHER) env $(TEST_ENV) $(abs_srcdir)/run_tests_separately.sh \
+		-g $(abs_builddir)/gtest -f "$(GTEST_FILTER)"
+
+#
+# Same, but one process per suite. Startup dominates a single case, so this is
+# the cheaper way to keep suites from interfering with one another.
+#
+test_by_suite: ucx gtest
+	$(LAUNCHER) env $(TEST_ENV) $(abs_srcdir)/run_tests_separately.sh \
+		-g $(abs_builddir)/gtest -f "$(GTEST_FILTER)" -s
 
 #
 # Run unit tests with GDB

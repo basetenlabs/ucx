@@ -518,16 +518,73 @@ size_t ucp_proto_rndv_thresh(const ucp_proto_init_params_t *init_params)
     return rndv_thresh;
 }
 
+/* Lanes sharing a device with a lane that has already failed. A device whose
+ * lane erred is suspect: if it is down, its remaining lanes will err in turn.
+ * Rendezvous has a single control lane carrying RTS/RTR/ATS/ATP, so placing it
+ * back on such a device costs another failure and another reconfiguration
+ * before the endpoint can make progress. Lanes are matched by resource device
+ * name, which for IB is "<device>:<port>", so a sibling port of a multi-port
+ * HCA is not implicated by its neighbour.
+ *
+ * This only steers selection. It deliberately does NOT mark the co-located
+ * lanes failed: they may be perfectly usable, and condemning them would turn
+ * one recoverable lane failure into an endpoint failure. */
+static ucp_lane_map_t
+ucp_proto_rndv_suspect_device_lanes(const ucp_proto_init_params_t *params)
+{
+    const ucp_ep_config_key_t *key = params->ep_config_key;
+    ucp_context_h context          = params->worker->context;
+    ucp_lane_map_t suspect         = 0;
+    ucp_lane_index_t failed_lane, lane;
+    ucp_rsc_index_t failed_rsc, rsc;
+
+    for (failed_lane = 0; failed_lane < key->num_lanes; ++failed_lane) {
+        if (!(key->lanes[failed_lane].lane_types &
+              UCS_BIT(UCP_LANE_TYPE_FAILED))) {
+            continue;
+        }
+
+        failed_rsc = key->lanes[failed_lane].rsc_index;
+        if (failed_rsc == UCP_NULL_RESOURCE) {
+            continue;
+        }
+
+        for (lane = 0; lane < key->num_lanes; ++lane) {
+            rsc = key->lanes[lane].rsc_index;
+            if ((rsc != UCP_NULL_RESOURCE) &&
+                !strcmp(context->tl_rscs[rsc].tl_rsc.dev_name,
+                        context->tl_rscs[failed_rsc].tl_rsc.dev_name)) {
+                suspect |= UCS_BIT(lane);
+            }
+        }
+    }
+
+    return suspect;
+}
+
 ucp_lane_index_t
 ucp_proto_rndv_find_ctrl_lane(const ucp_proto_init_params_t *params)
 {
+    ucp_lane_map_t suspect = ucp_proto_rndv_suspect_device_lanes(params);
     ucp_lane_index_t lane, num_lanes;
 
+    /* Prefer a lane on a device that has not failed yet. */
     num_lanes = ucp_proto_common_find_lanes(params,
                                             UCP_PROTO_COMMON_INIT_FLAG_HDR_ONLY,
                                             UCP_LANE_TYPE_AM,
-                                            UCT_IFACE_FLAG_AM_BCOPY, 0, 1, 0,
-                                            NULL, &lane);
+                                            UCT_IFACE_FLAG_AM_BCOPY, 0, 1,
+                                            suspect, NULL, &lane);
+    if ((num_lanes == 0) && (suspect != 0)) {
+        /* Every candidate shares a device with a failed lane. A control lane on
+         * a suspect device still beats no control lane at all. */
+        ucs_debug("%s: all active message lanes are on devices with a failed "
+                  "lane, keeping the preference unsatisfied",
+                  ucp_proto_id_field(params->proto_id, name));
+        num_lanes = ucp_proto_common_find_lanes(
+                params, UCP_PROTO_COMMON_INIT_FLAG_HDR_ONLY, UCP_LANE_TYPE_AM,
+                UCT_IFACE_FLAG_AM_BCOPY, 0, 1, 0, NULL, &lane);
+    }
+
     if (num_lanes == 0) {
         ucs_debug("no active message lane for %s",
                   ucp_proto_id_field(params->proto_id, name));
@@ -557,7 +614,18 @@ void ucp_proto_rndv_rts_probe(const ucp_proto_init_params_t *init_params)
         .super.hdr_size      = 0,
         .super.send_op       = UCT_EP_OP_AM_BCOPY,
         .super.memtype_op    = UCT_EP_OP_LAST,
-        .super.flags         = UCP_PROTO_COMMON_INIT_FLAG_ERR_HANDLING,
+        /* FAILOVER admits the rendezvous chain under
+         * UCP_ERR_HANDLING_MODE_FAILOVER, where it would otherwise be rejected
+         * and every large message would fall back to eager. What it buys is
+         * data-path recovery: a fetch or write that fails with a lane restarts
+         * on a surviving one. It does not make the control leg reliable - if
+         * the RTS itself (or its reply) is lost with the lane, the transfer
+         * waits for the application timeout, and recovering from that is the
+         * application's business: replaying an RTS here cannot be exactly-once,
+         * because the replay carries a new request id and the receive path has
+         * no duplicate check. */
+        .super.flags         = UCP_PROTO_COMMON_INIT_FLAG_ERR_HANDLING |
+                               UCP_PROTO_COMMON_INIT_FLAG_FAILOVER,
         .super.exclude_map   = 0,
         .super.reg_mem_info  = ucp_proto_common_select_param_mem_info(
                                                      init_params->select_param),

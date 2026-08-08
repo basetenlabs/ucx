@@ -115,6 +115,15 @@ ucp_proto_rndv_get_zcopy_fetch_completion(uct_completion_t *uct_comp)
     ucp_datatype_iter_mem_dereg(&req->send.state.dt_iter,
                                 UCS_BIT(UCP_DATATYPE_CONTIG));
     if (ucs_unlikely(uct_comp->status != UCS_OK)) {
+        if (ucp_ep_err_mode_eq(req->send.ep, UCP_ERR_HANDLING_MODE_FAILOVER) &&
+            !(req->send.ep->flags & UCP_EP_FLAG_FAILED)) {
+            /* A lane failed but the endpoint is recovering: restart the
+             * fetch on the surviving lanes instead of failing the receive.
+             * Keep the rkey - the remote buffer is still registered until
+             * ATS is sent. */
+            ucp_proto_request_restart(req);
+            return;
+        }
         ucp_proto_rndv_rkey_destroy(req);
         ucp_proto_rndv_recv_complete_status(req, uct_comp->status);
         return;
@@ -137,7 +146,8 @@ ucp_proto_rndv_get_zcopy_probe(const ucp_proto_init_params_t *init_params)
             init_params, UCS_BIT(UCP_RNDV_MODE_GET_ZCOPY), SIZE_MAX,
             UCT_EP_OP_LAST,
             UCP_PROTO_COMMON_INIT_FLAG_SEND_ZCOPY |
-            UCP_PROTO_COMMON_INIT_FLAG_ERR_HANDLING,
+            UCP_PROTO_COMMON_INIT_FLAG_ERR_HANDLING |
+            UCP_PROTO_COMMON_INIT_FLAG_FAILOVER,
             0, 0, &reg_mem_info);
 }
 
@@ -223,6 +233,10 @@ static ucs_status_t ucp_rndv_get_zcopy_proto_reset(ucp_request_t *req)
     switch (req->send.proto_stage) {
     case UCP_PROTO_RNDV_GET_STAGE_FETCH:
         ucp_datatype_iter_mem_dereg(&req->send.state.dt_iter, UCP_DT_MASK_ALL);
+        /* Restart fetches from the beginning: remote reads are idempotent,
+         * and rewinding avoids requiring RESUME support from the protocol
+         * selected after reconfiguration. */
+        ucp_datatype_iter_rewind(&req->send.state.dt_iter, UCP_DT_MASK_ALL);
         /* Fall through */
     case UCP_PROTO_RNDV_GET_STAGE_ATS:
         break;

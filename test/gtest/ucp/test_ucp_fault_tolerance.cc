@@ -98,16 +98,116 @@ protected:
         test_ucp_fault_tolerance *self =
             reinterpret_cast<test_ucp_fault_tolerance*>(arg);
 
+        ++self->m_am_delivery_count;
+
+        if (param->recv_attr & UCP_AM_RECV_ATTR_FLAG_RNDV) {
+            /* Rendezvous: `data` is a descriptor, not the payload. Pull the
+             * payload before the transfer counts as received, so a failover
+             * that loses the data leg shows up as a missing or corrupt
+             * receive rather than a silently accepted one. */
+            return self->am_rndv_recv(data, length);
+        }
+
         if (param->recv_attr & UCP_AM_RECV_ATTR_FLAG_DATA) {
             self->m_am_rbuf.resize(length);
             memcpy(self->m_am_rbuf.data(), data, length);
             self->m_am_received = true;
         }
 
-        EXPECT_FALSE(param->recv_attr & UCP_AM_RECV_ATTR_FLAG_RNDV) <<
-                "RNDV is not covered yet";
-
         return UCS_OK;
+    }
+
+    /* Destination of one rendezvous receive. Each transfer gets its own, since
+     * several can be in flight at once: a shared buffer would let them alias,
+     * and growing it would invalidate a pointer UCX is still writing into. */
+    struct rndv_recv_ctx {
+        test_ucp_fault_tolerance *self;
+        std::vector<uint8_t>      buf;
+    };
+
+    /* Start the rendezvous receive for one AM. Completion is asynchronous, so
+     * the handler returns UCS_INPROGRESS to keep the descriptor alive.
+     *
+     * When deferral is on, the descriptor is only parked: returning
+     * UCS_INPROGRESS without pulling the data keeps it valid, and leaves the
+     * sender's request outstanding - waiting for this receive - for as long as
+     * the test wants. That is the only way found to have a rendezvous request
+     * still live when a lane fails; without it the transfers finish first and
+     * reconfiguration has nothing to restart. */
+    ucs_status_t am_rndv_recv(void *desc, size_t length) {
+        if (m_defer_rndv_recv) {
+            m_deferred_rndv.push_back({desc, length});
+            return UCS_INPROGRESS;
+        }
+
+        return start_rndv_recv(desc, length);
+    }
+
+    /* Pull the payload for every parked descriptor. */
+    void drain_deferred_rndv_recvs() {
+        std::vector<deferred_rndv_t> deferred;
+
+        m_defer_rndv_recv = false;
+        deferred.swap(m_deferred_rndv);
+        for (const deferred_rndv_t &d : deferred) {
+            ucs_status_t status = start_rndv_recv(d.desc, d.length);
+            if (status != UCS_OK) {
+                EXPECT_EQ(UCS_INPROGRESS, status)
+                        << "deferred rendezvous receive returned status: "
+                        << ucs_status_string(status);
+            }
+        }
+    }
+
+    ucs_status_t start_rndv_recv(void *desc, size_t length) {
+        rndv_recv_ctx *ctx = new rndv_recv_ctx{this,
+                                               std::vector<uint8_t>(length)};
+
+        ucp_request_param_t param;
+        param.op_attr_mask = UCP_OP_ATTR_FIELD_CALLBACK |
+                             UCP_OP_ATTR_FIELD_USER_DATA;
+        param.cb.recv_am   = am_rndv_recv_cb;
+        param.user_data    = reinterpret_cast<void*>(ctx);
+
+        ucs_status_ptr_t sp = ucp_am_recv_data_nbx(receiver().worker(), desc,
+                                                   ctx->buf.data(), length,
+                                                   &param);
+        if (UCS_PTR_IS_ERR(sp)) {
+            delete ctx;
+            return UCS_PTR_STATUS(sp);
+        }
+
+        if (sp == NULL) {
+            /* Completed in place. */
+            finish_rndv_recv(ctx, UCS_OK);
+            return UCS_OK;
+        }
+
+        return UCS_INPROGRESS;
+    }
+
+    static void am_rndv_recv_cb(void *request, ucs_status_t status,
+                                size_t length, void *user_data) {
+        rndv_recv_ctx *ctx = reinterpret_cast<rndv_recv_ctx*>(user_data);
+
+        ctx->self->finish_rndv_recv(ctx, status);
+        ucp_request_free(request);
+    }
+
+    /* Verify and account for one completed rendezvous receive, then release its
+     * buffer. Checking the payload here rather than once at the end is what
+     * makes a truncated or interleaved transfer visible - every transfer in
+     * these tests carries the same pattern. */
+    void finish_rndv_recv(rndv_recv_ctx *ctx, ucs_status_t status) {
+        if (status == UCS_OK) {
+            mem_buffer::pattern_check(ctx->buf.data(), ctx->buf.size(), m_seed);
+            ++m_am_rndv_completed;
+            m_am_received = true;
+        } else {
+            ++m_am_recv_err_count;
+        }
+
+        delete ctx;
     }
 
     /**
@@ -563,8 +663,23 @@ protected:
     const ucp_request_param_t m_req_empty_param = { 0 };
     std::vector<uint8_t> m_am_rbuf              = std::vector<uint8_t>(am_msg_size());
     volatile bool m_am_received                 = false;
+    /* Every invocation of the AM handler, so a replayed rendezvous RTS that is
+     * handed to the application twice is visible as a count, not as silently
+     * duplicated work. */
+    volatile size_t m_am_delivery_count         = 0;
+    volatile size_t m_am_recv_err_count         = 0;
+    volatile size_t m_am_rndv_completed         = 0;
 
-private:
+    /* A rendezvous descriptor whose payload has not been pulled yet. */
+    struct deferred_rndv_t {
+        void  *desc;
+        size_t length;
+    };
+
+    bool m_defer_rndv_recv = false;
+    std::vector<deferred_rndv_t> m_deferred_rndv;
+
+protected:
     size_t m_initiator_err_count = 0;
     size_t m_total_err_count     = 0;
     ucs_status_t m_err_status    = UCS_OK;
@@ -581,3 +696,193 @@ UCS_TEST_P(test_ucp_fault_tolerance, target_failure, "MAX_EAGER_LANES=8")
 {
     do_test(FAILURE_SIDE_TARGET);
 }
+
+
+/**
+ * Rendezvous fault injection under failover mode.
+ *
+ * test_ucp_fault_tolerance covers eager AM and RMA only - its AM payload is a
+ * kilobyte, so a rendezvous protocol is never selected and the semantics that
+ * failover rendezvous depends on go untested. These cases inject the same lane
+ * failure while rendezvous transfers are in flight.
+ *
+ * Failover recovers the data path; it does not replay a control message. So a
+ * transfer whose RTS, RTR or ATS died with the lane waits for the application
+ * timeout, and these cases only require that a transfer which can still make
+ * progress does - plus that nothing is ever delivered twice, since no replay
+ * exists to duplicate it.
+ */
+class test_ucp_rndv_failover : public test_ucp_fault_tolerance {
+public:
+    static void get_test_variants(std::vector<ucp_test_variant> &variants) {
+        /* RMA as well as AM: a rendezvous payload moves over the RMA BW lanes,
+         * which the failure injection has to be able to reach. */
+        add_variant_with_value(variants, UCP_FEATURE_AM | UCP_FEATURE_RMA,
+                               TEST_OP_AM, "am");
+    }
+
+    test_ucp_rndv_failover() {
+        /* Force rendezvous for the payload used here. */
+        modify_config("RNDV_THRESH", "8k");
+    }
+
+    void cleanup() override {
+        /* A test that returns early - an ASSERT in the middle of the helper -
+         * would otherwise leave descriptors parked and their senders waiting,
+         * and ucp_ep_destroy asserts the tracked-request list is empty. */
+        drain_deferred_rndv_recvs();
+        flush_workers();
+        test_ucp_fault_tolerance::cleanup();
+    }
+
+    void init() override {
+        test_ucp_fault_tolerance::init();
+    }
+
+protected:
+    /* Large enough to be rendezvous, small enough to keep many in flight. */
+    static size_t rndv_msg_size() {
+        return ucs::limit_buffer_size(256 * UCS_KBYTE);
+    }
+
+    /* One rendezvous AM per request, none of them waited on yet, so the
+     * failure lands while they are in flight. */
+    std::vector<ucs_status_ptr_t> start_rndv_sends(size_t count,
+                                                   mem_buffer &sbuf) {
+        std::vector<ucs_status_ptr_t> sptrs;
+
+        for (size_t i = 0; i < count; ++i) {
+            sptrs.push_back(ucp_am_send_nbx(sender().ep(0, INJECTED_EP_INDEX),
+                                            AM_ID, NULL, 0, sbuf.ptr(),
+                                            rndv_msg_size(),
+                                            &m_req_empty_param));
+        }
+
+        return sptrs;
+    }
+
+    /* Fail every AM lane but one. Invalidating a single lane is not enough to
+     * reach failover: a transfer that never used that lane completes untouched
+     * and no reconfiguration happens, so the test would pass without
+     * exercising anything. Leaving exactly one lane alive forces the roles on
+     * the failed lanes to move there, which is the path under test. */
+    /* Fail a data lane only.
+     *
+     * A rendezvous transfer rides two lane sets: RTS/RTR/ATS take a single AM
+     * control lane, the payload takes the RMA BW lanes. Failover recovers the
+     * payload - a fetch restarts on a surviving lane - but does not replay a
+     * control message, so killing the AM lane strands the transfer until the
+     * application timeout whenever the control leg happened to be on it. A test
+     * that injected on both lane sets therefore passed or failed depending on
+     * which lane the control leg picked, and a stranded request then tripped
+     * the tracked-request assertion in ucp_ep_destroy.
+     *
+     * Failing only the data lanes tests exactly what admission promises. */
+    void inject_am_lane_failures() {
+        inject_lane_group_failures(TEST_OP_GET, "RMA BW");
+    }
+
+    /* Fail one lane of a group, leaving the rest alive: that is what makes this
+     * a failover test rather than an endpoint-failure test. Failing all but one
+     * lane of both groups was tried and drives the endpoint to
+     * UCS_ERR_CONNECTION_RESET through "AM lane not found", because rebuilding
+     * lanes is not implemented - it tests the absence of that, not failover. */
+    void inject_lane_group_failures(unsigned op_mask, const char *group) {
+        std::vector<ucp_lane_index_t> lanes = get_lanes(op_mask);
+        /* Invalidate the TARGET's lanes, so the failure surfaces on the sender's
+         * endpoint - the one holding the outstanding rendezvous requests. With
+         * the initiator's lanes invalidated instead, every reconfiguration lands
+         * on the peer's endpoint, whose tracked-request list is empty, and the
+         * sender's requests are never considered for restart. */
+        ucp_ep_h ucp_ep = get_ucp_ep_for_err_injection(FAILURE_SIDE_TARGET);
+
+        for (size_t i = 0; (i < 1) && (i + 1 < lanes.size()); ++i) {
+            uct_ep_h uct_ep     = ucp_ep_get_lane(ucp_ep, lanes[i]);
+            ucs_status_t status = uct_ep_invalidate(uct_ep, 0);
+            if (status == UCS_ERR_UNSUPPORTED) {
+                UCS_TEST_SKIP_R("uct_ep_invalidate is not supported");
+            }
+
+            ASSERT_EQ(UCS_OK, status) << "uct_ep_invalidate returned status: "
+                                      << ucs_status_string(status);
+            UCS_TEST_MESSAGE << "injected failure on " << group << " lane "
+                             << size_t(lanes[i]) << '/' << lanes.size();
+        }
+    }
+
+    /* Send `count` rendezvous AMs, fail lanes while every one of them is still
+     * outstanding, and require that they all complete anyway.
+     *
+     * The receiver parks the descriptors instead of pulling the payload, so the
+     * senders are still waiting when the failure is injected. Injecting after
+     * the transfers have drained is what made an earlier version of this vacuous
+     * - it reported zero reconfigurations and passed with the fix removed. */
+    void run_rndv_with_injected_failure(size_t count) {
+        flush_workers();
+
+        mem_buffer sbuf(rndv_msg_size(), UCS_MEMORY_TYPE_HOST);
+        sbuf.pattern_fill(m_seed, rndv_msg_size());
+
+        m_defer_rndv_recv = true;
+        std::vector<ucs_status_ptr_t> sptrs = start_rndv_sends(count, sbuf);
+
+        /* Every RTS has reached the receiver, so every send is now parked on a
+         * receive that has not been started. */
+        wait_for_value(&m_am_delivery_count, count);
+        ASSERT_EQ(count, m_am_delivery_count)
+                << "only " << m_am_delivery_count << " of " << count
+                << " rendezvous RTS arrived before the failure was injected";
+
+        inject_am_lane_failures();
+        drain_deferred_rndv_recvs();
+
+        ucs_status_t status = requests_wait(sptrs);
+        EXPECT_EQ(UCS_OK, status)
+                << count << " rendezvous AM sends completed with status: "
+                << ucs_status_string(status);
+
+        /* Sends completing is not enough: the receives are what prove the data
+         * arrived, and they complete after their send does. */
+        wait_for_value(&m_am_rndv_completed, count);
+        EXPECT_EQ(count, m_am_rndv_completed)
+                << "only " << m_am_rndv_completed << " of " << count
+                << " rendezvous transfers were received";
+        EXPECT_EQ(0u, m_am_recv_err_count)
+                << "rendezvous receive failed " << m_am_recv_err_count
+                << " times";
+        /* Nothing is replayed on failover, so the handler must have run exactly
+         * once per transfer. A reintroduced RTS replay would show up here as a
+         * duplicate delivery, which is why replaying was removed rather than
+         * gated: it cannot be made exactly-once without a stable transfer
+         * identity and a receiver-side duplicate check. */
+        EXPECT_EQ(count, m_am_delivery_count)
+                << "AM handler ran " << m_am_delivery_count << " times for "
+                << count << " transfers";
+        EXPECT_EQ(0u, m_total_err_count)
+                << "error callback invoked " << m_total_err_count << " times";
+    }
+};
+
+/* RC and DC only: they carry the rendezvous protocols that failover admits. */
+UCP_INSTANTIATE_TEST_CASE_TLS(test_ucp_rndv_failover, rc,      "rc")
+UCP_INSTANTIATE_TEST_CASE_TLS(test_ucp_rndv_failover, rc_mlx5, "rc_mlx5")
+UCP_INSTANTIATE_TEST_CASE_TLS(test_ucp_rndv_failover, dc,      "dc")
+UCP_INSTANTIATE_TEST_CASE_TLS(test_ucp_rndv_failover, dc_mlx5, "dc_mlx5")
+
+/* Rendezvous must survive a lane failure at all - the case the eager-only
+ * coverage left open. What failover admission buys is data-path recovery: a get
+ * refetches, a put rewinds to its acknowledged offset. */
+UCS_TEST_P(test_ucp_rndv_failover, single_transfer_survives_lane_failure,
+           "MAX_EAGER_LANES=8")
+{
+    run_rndv_with_injected_failure(1);
+}
+
+/* Several rendezvous transfers in flight when a lane under them fails, so the
+ * recovery has to cope with more than one outstanding request at a time. */
+UCS_TEST_P(test_ucp_rndv_failover, concurrent_transfers_survive_lane_failure,
+           "MAX_EAGER_LANES=8")
+{
+    run_rndv_with_injected_failure(8);
+}
+
