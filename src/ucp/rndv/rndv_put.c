@@ -465,6 +465,14 @@ static ucs_status_t ucp_proto_rndv_put_zcopy_reset(ucp_request_t *req)
 {
     const ucp_proto_rndv_put_priv_t *rpriv = req->send.proto_config->priv;
 
+    /* The write resumes against the peer's remote key, which came from the
+     * RTS and cannot be re-acquired here. Refuse the restart if a completion
+     * path released it, so the request fails instead of re-selecting a
+     * protocol that would dereference it. */
+    if (req->send.rndv.rkey == NULL) {
+        return UCS_ERR_CONNECTION_RESET;
+    }
+
     if (req->send.rndv.put.atp_count == rpriv->atp_num_lanes) {
         /* Sent all ATPs so the iterator should be at the end */
         ucs_assertv_always(ucp_datatype_iter_is_end(&req->send.state.dt_iter),
