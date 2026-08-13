@@ -43,12 +43,22 @@ ucp_proto_rndv_put_common_complete(ucp_request_t *req)
 {
     const ucp_proto_rndv_put_priv_t UCS_V_UNUSED *rpriv =
                                                    req->send.proto_config->priv;
+    ucs_status_t status = req->send.state.uct_comp.status;
+
     ucp_trace_req(req, "rndv_put_common_complete");
     UCS_STATS_UPDATE_COUNTER(req->send.ep->worker->stats, rpriv->stat_counter,
                              +1);
-    ucp_proto_rndv_rkey_destroy(req);
-    ucp_proto_rndv_request_zcopy_complete(req,
-                                          req->send.state.uct_comp.status);
+
+    /* Keep the rkey when the completion below is going to restart this write
+     * on the surviving lanes rather than complete it: the remote buffer stays
+     * registered until ATP, and the restarted send reads the rkey again. The
+     * get scheme keeps it for the same reason. Destroying it here first left
+     * the restart dereferencing a NULL rkey. */
+    if (!ucp_proto_request_is_failover_restart(req, status)) {
+        ucp_proto_rndv_rkey_destroy(req);
+    }
+
+    ucp_proto_rndv_request_zcopy_complete(req, status);
 }
 
 static void ucp_proto_rndv_put_zcopy_completion(uct_completion_t *uct_comp)

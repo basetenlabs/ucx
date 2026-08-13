@@ -115,8 +115,7 @@ ucp_proto_rndv_get_zcopy_fetch_completion(uct_completion_t *uct_comp)
     ucp_datatype_iter_mem_dereg(&req->send.state.dt_iter,
                                 UCS_BIT(UCP_DATATYPE_CONTIG));
     if (ucs_unlikely(uct_comp->status != UCS_OK)) {
-        if (ucp_ep_err_mode_eq(req->send.ep, UCP_ERR_HANDLING_MODE_FAILOVER) &&
-            !(req->send.ep->flags & UCP_EP_FLAG_FAILED)) {
+        if (ucp_proto_request_is_failover_restart(req, uct_comp->status)) {
             /* A lane failed but the endpoint is recovering: restart the
              * fetch on the surviving lanes instead of failing the receive.
              * Keep the rkey - the remote buffer is still registered until

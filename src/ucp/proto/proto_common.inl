@@ -93,6 +93,19 @@ ucp_proto_request_zcopy_clean(ucp_request_t *req, unsigned dt_mask)
     req->flags &= ~UCP_REQUEST_FLAG_PROTO_INITIALIZED;
 }
 
+/* Whether a completion with this status will restart the request instead of
+ * completing it. Callers that release per-request resources before completing
+ * must ask first: anything the restarted send still needs (a remote rkey, for
+ * one) has to outlive the completion. */
+static UCS_F_ALWAYS_INLINE int
+ucp_proto_request_is_failover_restart(const ucp_request_t *req,
+                                      ucs_status_t status)
+{
+    return ucs_unlikely(status != UCS_OK) &&
+           ucp_ep_err_mode_eq(req->send.ep, UCP_ERR_HANDLING_MODE_FAILOVER) &&
+           !(req->send.ep->flags & UCP_EP_FLAG_FAILED);
+}
+
 static UCS_F_ALWAYS_INLINE void
 ucp_proto_request_zcopy_complete_cb(ucp_request_t *req, ucs_status_t status,
                                     ucp_request_callback_t complete_cb)
@@ -105,9 +118,7 @@ ucp_proto_request_zcopy_complete_cb(ucp_request_t *req, ucs_status_t status,
         UCP_EP_STAT_TAG_OP(req->send.ep, EAGER)
     }
 
-    if (ucs_unlikely(status != UCS_OK) &&
-        ucp_ep_err_mode_eq(req->send.ep, UCP_ERR_HANDLING_MODE_FAILOVER) &&
-        !(req->send.ep->flags & UCP_EP_FLAG_FAILED)) {
+    if (ucp_proto_request_is_failover_restart(req, status)) {
         ucp_proto_request_restart(req);
     } else {
         if (complete_cb != NULL) {
