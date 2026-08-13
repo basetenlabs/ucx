@@ -43,11 +43,21 @@ ucp_proto_rndv_put_common_complete(ucp_request_t *req)
 {
     const ucp_proto_rndv_put_priv_t UCS_V_UNUSED *rpriv =
                                                    req->send.proto_config->priv;
+    ucs_status_t status = req->send.state.uct_comp.status;
+
     ucp_trace_req(req, "rndv_put_common_complete");
     UCS_STATS_UPDATE_COUNTER(req->send.ep->worker->stats, rpriv->stat_counter,
                              +1);
-    ucp_proto_rndv_rkey_destroy(req);
-    ucp_proto_request_zcopy_complete(req, req->send.state.uct_comp.status);
+    /* An error completion in FAILOVER error handling mode restarts the
+     * request instead of completing it (see
+     * ucp_proto_request_zcopy_complete), and the restarted send reads
+     * req->send.rndv.rkey. Destroy the rkey only when the request is
+     * really completing. */
+    if (ucs_likely(status == UCS_OK) ||
+        !ucp_ep_err_mode_eq(req->send.ep, UCP_ERR_HANDLING_MODE_FAILOVER)) {
+        ucp_proto_rndv_rkey_destroy(req);
+    }
+    ucp_proto_request_zcopy_complete(req, status);
 }
 
 static void ucp_proto_rndv_put_zcopy_completion(uct_completion_t *uct_comp)
