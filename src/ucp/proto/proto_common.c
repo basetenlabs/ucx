@@ -876,10 +876,22 @@ void ucp_proto_request_restart(ucp_request_t *req)
                   proto_config->proto->name, req->send.proto_stage);
 
     status = proto_config->proto->reset(req);
+    if (status == UCS_ERR_CANCELED) {
+        /* The request was already completed by cancellation. */
+        return;
+    }
+
     if (status != UCS_OK) {
-        ucs_assertv_always(status == UCS_ERR_CANCELED,
-                           "req %p, failed to reset: status %s", req,
-                           ucs_status_string(status));
+        /* The protocol cannot resume from this state - a rendezvous protocol
+         * whose remote key has already been released, for instance. Restart
+         * re-enters protocol selection, so the request must still own
+         * everything the selected protocol will use, and reset is the only
+         * place that can tell. Fail the request rather than re-selecting on
+         * top of resources it no longer holds: the caller sees a failed
+         * transfer instead of the worker dereferencing a released one. */
+        ucs_error("req %p: proto %s cannot restart (%s); aborting the request",
+                  req, proto_config->proto->name, ucs_status_string(status));
+        ucp_proto_request_abort(req, status);
         return;
     }
 

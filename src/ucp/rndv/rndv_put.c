@@ -43,12 +43,22 @@ ucp_proto_rndv_put_common_complete(ucp_request_t *req)
 {
     const ucp_proto_rndv_put_priv_t UCS_V_UNUSED *rpriv =
                                                    req->send.proto_config->priv;
+    ucs_status_t status = req->send.state.uct_comp.status;
+
     ucp_trace_req(req, "rndv_put_common_complete");
     UCS_STATS_UPDATE_COUNTER(req->send.ep->worker->stats, rpriv->stat_counter,
                              +1);
-    ucp_proto_rndv_rkey_destroy(req);
-    ucp_proto_rndv_request_zcopy_complete(req,
-                                          req->send.state.uct_comp.status);
+
+    /* Keep the rkey when the completion below is going to restart this write
+     * on the surviving lanes rather than complete it: the remote buffer stays
+     * registered until ATP, and the restarted send reads the rkey again. The
+     * get scheme keeps it for the same reason. Destroying it here first left
+     * the restart dereferencing a NULL rkey. */
+    if (!ucp_proto_request_is_failover_restart(req, status)) {
+        ucp_proto_rndv_rkey_destroy(req);
+    }
+
+    ucp_proto_rndv_request_zcopy_complete(req, status);
 }
 
 static void ucp_proto_rndv_put_zcopy_completion(uct_completion_t *uct_comp)
@@ -454,6 +464,14 @@ ucp_proto_rndv_put_zcopy_query(const ucp_proto_query_params_t *params,
 static ucs_status_t ucp_proto_rndv_put_zcopy_reset(ucp_request_t *req)
 {
     const ucp_proto_rndv_put_priv_t *rpriv = req->send.proto_config->priv;
+
+    /* The write resumes against the peer's remote key, which came from the
+     * RTS and cannot be re-acquired here. Refuse the restart if a completion
+     * path released it, so the request fails instead of re-selecting a
+     * protocol that would dereference it. */
+    if (req->send.rndv.rkey == NULL) {
+        return UCS_ERR_CONNECTION_RESET;
+    }
 
     if (req->send.rndv.put.atp_count == rpriv->atp_num_lanes) {
         /* Sent all ATPs so the iterator should be at the end */
