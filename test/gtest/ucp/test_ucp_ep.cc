@@ -1,11 +1,15 @@
 /**
- * Copyright (c) NVIDIA CORPORATION & AFFILIATES, 2001-2021. ALL RIGHTS RESERVED.
+ * Copyright (c) NVIDIA CORPORATION & AFFILIATES, 2001-2026. ALL RIGHTS RESERVED.
  *
  * See file LICENSE for terms.
  */
 
 #include "ucp_test.h"
 #include <ucp/core/ucp_context.h>
+
+extern "C" {
+#include <ucp/core/ucp_ep.inl>
+}
 
 class test_ucp_ep : public ucp_test {
 public:
@@ -93,3 +97,24 @@ UCS_TEST_P(test_ucp_ep, ucp_query_transport)
 }
 
 UCP_INSTANTIATE_TEST_CASE(test_ucp_ep);
+
+class test_ucp_ep_recovery : public test_ucp_ep {
+};
+
+UCS_TEST_P(test_ucp_ep_recovery, exhausted_stays_idle)
+{
+    ucp_ep_h ep              = sender().ep();
+    ucp_ep_config_key_t *key = &ucp_ep_config(ep)->key;
+    ucp_lane_index_t lane    = key->am_lane;
+    ucp_lane_type_mask_t lane_types;
+
+    ASSERT_NE(UCP_NULL_LANE, lane);
+    ASSERT_EQ(NULL, ep->ext->recovery_arg);
+
+    lane_types = key->lanes[lane].lane_types;
+    key->lanes[lane].lane_types |= UCS_BIT(UCP_LANE_TYPE_FAILED);
+    EXPECT_EQ(0, ucp_ep_recovery_progress(ep));
+    key->lanes[lane].lane_types = lane_types;
+}
+
+UCP_INSTANTIATE_TEST_CASE_TLS(test_ucp_ep_recovery, self, "self")

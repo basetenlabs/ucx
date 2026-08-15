@@ -1,5 +1,5 @@
 /**
-* Copyright (c) NVIDIA CORPORATION & AFFILIATES, 2001-2020. ALL RIGHTS RESERVED.
+* Copyright (c) NVIDIA CORPORATION & AFFILIATES, 2001-2026. ALL RIGHTS RESERVED.
 * Copyright (C) Los Alamos National Security, LLC. 2019 ALL RIGHTS RESERVED.
 *
 * See file LICENSE for terms.
@@ -1935,7 +1935,11 @@ int ucp_ep_recovery_progress(ucp_ep_h ep)
         goto done;
     }
 
-    ucs_assert(ep->ext->recovery_arg != NULL);
+    if (ep->ext->recovery_arg == NULL) {
+        /* Recovery retries were exhausted for the remaining failed lanes. */
+        goto done;
+    }
+
     ucs_assert(ep->ext->recovery_arg->retries_left > 0);
 
     recovered = ucp_ep_recovery_get_ready_lanes(ep, failed);
