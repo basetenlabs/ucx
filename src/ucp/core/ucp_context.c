@@ -471,7 +471,8 @@ static ucs_config_field_t ucp_context_config_table[] = {
   {"PROTO_INDIRECT_ID", "auto",
    "Enable indirect IDs to object pointers (endpoint, request) in wire protocols.\n"
    "A value of 'auto' means to enable only if error handling is enabled on the\n"
-   "endpoint.",
+   "endpoint. Failover endpoints always use indirect IDs, even if this option\n"
+   "is disabled.",
    ucs_offsetof(ucp_context_config_t, proto_indirect_id), UCS_CONFIG_TYPE_ON_OFF_AUTO},
 
   {"RNDV_PUT_FORCE_FLUSH", "n",
