@@ -1135,13 +1135,21 @@ static ucs_status_t ucp_wireup_msg_handler(void *arg, void *data,
     if (msg->dst_ep_id != UCS_PTR_MAP_KEY_INVALID) {
         UCP_WORKER_GET_EP_BY_ID(
                 &ep, worker, msg->dst_ep_id,
-                if (msg->type != UCP_WIREUP_MSG_EP_CHECK) { goto out; },
+                if ((msg->type != UCP_WIREUP_MSG_EP_CHECK) &&
+                    (msg->type != UCP_WIREUP_MSG_LANES_ADDR_REQUEST)) {
+                    goto out;
+                },
                 "WIREUP message (%d src_ep_id 0x%" PRIx64 " sn %d)", msg->type,
                 msg->src_ep_id, msg->conn_sn);
 
         if ((msg->type == UCP_WIREUP_MSG_EP_CHECK) && (ep != NULL)) {
             /* UCP EP is valid, no need for any other actions when handling
              * EP_CHECK message (e.g. can avoid remote address unpacking) */
+            goto out;
+        }
+
+        if ((ep != NULL) && (ep->flags & UCP_EP_FLAG_CLOSED) &&
+            (msg->type == UCP_WIREUP_MSG_LANES_ADDR_REPLY)) {
             goto out;
         }
     }
@@ -1177,6 +1185,10 @@ static ucs_status_t ucp_wireup_msg_handler(void *arg, void *data,
     } else if (msg->type == UCP_WIREUP_MSG_EP_REMOVED) {
         ucs_assert(msg->dst_ep_id != UCS_PTR_MAP_KEY_INVALID);
         ucp_ep_set_lanes_failed_schedule(ep, 0, UCS_ERR_CONNECTION_RESET);
+    } else if ((msg->type == UCP_WIREUP_MSG_LANES_ADDR_REQUEST) &&
+               ((ep == NULL) || (ep->flags & UCP_EP_FLAG_CLOSED))) {
+        ucs_assert(msg->dst_ep_id != UCS_PTR_MAP_KEY_INVALID);
+        ucp_wireup_send_ep_removed(worker, msg, &remote_address);
     } else if (msg->type == UCP_WIREUP_MSG_LANES_ADDR_REQUEST) {
         ucs_assert(msg->dst_ep_id != UCS_PTR_MAP_KEY_INVALID);
         ucs_assert(ep != NULL);
