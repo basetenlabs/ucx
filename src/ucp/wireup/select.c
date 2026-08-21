@@ -477,6 +477,12 @@ static UCS_F_NOINLINE ucs_status_t ucp_wireup_select_transport(
     tls_info[0]  = '\0';
     UCS_STATIC_BITMAP_AND_INPLACE(&tl_bitmap, select_params->tl_bitmap);
     UCS_STATIC_BITMAP_AND_INPLACE(&tl_bitmap, context->tl_bitmap);
+    /* Devices retired at runtime. Selection is the only place this needs to
+     * apply: the resources still exist and stay addressable, they are just no
+     * longer candidates -- including for the aux/UD lane used by wireup, which
+     * is the case that matters when a port dies under a live worker. */
+    UCS_STATIC_BITMAP_AND_INPLACE(
+            &tl_bitmap, UCS_STATIC_BITMAP_NOT(context->excluded_tl_bitmap));
     show_error   = (select_params->show_error && show_error);
 
     /* Check which remote addresses satisfy the criteria */

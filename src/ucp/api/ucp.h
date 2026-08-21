@@ -2450,6 +2450,34 @@ ucs_status_t ucp_worker_get_address_with_devices(
 
 /**
  * @ingroup UCP_WORKER
+ * @brief Stop using a local device for any future lane selection.
+ *
+ * Removes @a dev_name's transport resources from the set every subsequent
+ * endpoint draws from, on this worker's context. Endpoints already created keep
+ * their lanes; this affects selection from here on.
+ *
+ * Withdrawing a device from a published worker address (@ref
+ * ucp_worker_get_address_with_devices) is not sufficient by itself. That stops
+ * peers writing to the device, but this worker still selects it for its own
+ * outbound wireup: IB port state is read at device init, so a port that dies
+ * later still looks usable to selection, and the UD connect for wireup fails
+ * against it indefinitely. Both calls together are what fully retires a NIC.
+ *
+ * Not reversible -- restoring a device requires a new context, the same
+ * constraint UCX_NET_DEVICES has.
+ *
+ * @param [in] worker    Worker whose context should stop using the device.
+ * @param [in] dev_name  Device name as it appears in UCX_NET_DEVICES.
+ *
+ * @return UCS_OK on success, UCS_ERR_NO_ELEM if the device has no resources on
+ *         this context.
+ */
+ucs_status_t ucp_worker_exclude_device(ucp_worker_h worker,
+                                       const char *dev_name);
+
+
+/**
+ * @ingroup UCP_WORKER
  * @brief Release an address of the worker object.
  *
  * This routine release an @ref ucp_address_t "address handle" associated within

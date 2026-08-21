@@ -3501,6 +3501,55 @@ out:
     return status;
 }
 
+ucs_status_t ucp_worker_exclude_device(ucp_worker_h worker, const char *dev_name)
+{
+    ucp_context_h context = worker->context;
+    ucp_tl_bitmap_t dev_tl_bitmap;
+    ucs_status_t status;
+
+    UCP_WORKER_THREAD_CS_ENTER_CONDITIONAL(worker);
+
+    ucp_context_dev_tl_bitmap(context, dev_name, &dev_tl_bitmap);
+    if (UCS_STATIC_BITMAP_IS_ZERO(dev_tl_bitmap)) {
+        ucs_diag("ucp_worker_exclude_device: '%s' has no resources to exclude",
+                 dev_name);
+        status = UCS_ERR_NO_ELEM;
+        goto out;
+    }
+
+    /* Recorded in a dedicated mask that lane selection intersects, NOT by
+     * clearing context->tl_bitmap. That bitmap is also the index map for
+     * worker->ifaces (ucp_worker_iface does
+     * ifaces[POPCOUNT_UPTO_INDEX(tl_bitmap, rsc_index)]), so clearing a bit
+     * shifts every later iface index -- which aborts on the assertion there,
+     * and would silently mis-resolve ifaces without it.
+     *
+     * The effect is the same where it counts: selection stops offering the
+     * device, including for the aux/UD lane UCX picks for wireup, which is the
+     * case that motivated this.
+     *
+     * Withdrawing the device from a published address is not enough on its own:
+     * that stops peers writing to it, but this worker still picks it for its own
+     * outbound wireup, because IB port state is cached at device init and a
+     * later port death still looks ACTIVE to selection. Observed as
+     * ibv_create_ah() failing with ENODATA on the dead device, forever, so a
+     * peer's freshly built endpoint could never finish wiring up.
+     *
+     * Only ever clears bits, never sets them, so a concurrent selection either
+     * sees the device or does not -- it cannot see a half-built mask. Not
+     * reversible: bringing a device back needs a new context, which is the same
+     * constraint UCX_NET_DEVICES already has.
+     */
+    UCS_STATIC_BITMAP_OR_INPLACE(&context->excluded_tl_bitmap, dev_tl_bitmap);
+    ucs_info("ucp_worker_exclude_device: '%s' removed from lane selection on"
+             " worker %p", dev_name, worker);
+    status = UCS_OK;
+
+out:
+    UCP_WORKER_THREAD_CS_EXIT_CONDITIONAL(worker);
+    return status;
+}
+
 void ucp_worker_release_address(ucp_worker_h worker, ucp_address_t *address)
 {
     ucs_free(address);

@@ -2226,6 +2226,7 @@ static ucs_status_t ucp_fill_resources(ucp_context_h context,
      * Then the worker will open all available transport resources and will
      * select only the best ones for each particular device.
      */
+    UCS_STATIC_BITMAP_RESET_ALL(&context->excluded_tl_bitmap);
     UCS_STATIC_BITMAP_MASK(&context->tl_bitmap,
                            config->ctx.unified_mode ? 0 : context->num_tls);
 
