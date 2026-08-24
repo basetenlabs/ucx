@@ -3143,6 +3143,15 @@ static ucs_status_t ucp_worker_address_pack(ucp_worker_h worker,
         UCS_STATIC_BITMAP_SET_ALL(&tl_bitmap);
     }
 
+    /* A device retired with ucp_worker_exclude_device is not advertised either.
+     * Otherwise the two calls disagree: selection would refuse the device while
+     * the address kept inviting peers to it, which is the exact combination that
+     * strands traffic on a dead NIC.
+     */
+    UCS_STATIC_BITMAP_AND_INPLACE(
+            &tl_bitmap,
+            UCS_STATIC_BITMAP_NOT(worker->context->excluded_tl_bitmap));
+
     return ucp_worker_address_pack_bitmap(worker, &tl_bitmap, address_length_p,
                                           address_p);
 }
