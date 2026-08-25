@@ -268,7 +268,10 @@ enum ucp_ep_params_field {
     /**< Connection request field */
     UCP_EP_PARAM_FIELD_CONN_REQUEST      = UCS_BIT(6),
     UCP_EP_PARAM_FIELD_NAME              = UCS_BIT(7), /**< Endpoint name */
-    UCP_EP_PARAM_FIELD_LOCAL_SOCK_ADDR   = UCS_BIT(8)  /**< Local socket Address */
+    UCP_EP_PARAM_FIELD_LOCAL_SOCK_ADDR   = UCS_BIT(8), /**< Local socket Address */
+    UCP_EP_PARAM_FIELD_LOCAL_DEVICE      = UCS_BIT(9)  /**< Local device name to
+                                                            restrict this
+                                                            endpoint's lanes to */
 };
 
 
@@ -2404,6 +2407,73 @@ ucs_status_t ucp_worker_query(ucp_worker_h worker,
  * @param [in] stream       Output stream to print the information to.
  */
 void ucp_worker_print_info(ucp_worker_h worker, FILE *stream);
+
+
+/**
+ * @ingroup UCP_WORKER
+ * @brief Get the worker address, restricted to the given local devices.
+ *
+ * Packs a worker address containing only the transport resources belonging to
+ * @a dev_names, instead of every device on the worker as @ref
+ * ucp_worker_get_address does.
+ *
+ * This exists because a peer chooses which of this worker's devices to talk to
+ * purely from the address entries it was given: an address listing a device
+ * whose port has since died still invites the peer to use it, and no local
+ * setting on the peer's side can steer it away. Re-publishing a restricted
+ * address is therefore how a worker keeps its peers off a NIC it knows is
+ * unusable.
+ *
+ * Device names not present on the worker are skipped with a diagnostic. If none
+ * of the named devices has usable transport resources the call fails, rather
+ * than producing an address with no entries that would fail obscurely on the
+ * peer.
+ *
+ * The address must be released with @ref ucp_worker_release_address.
+ *
+ * @param [in]  worker            Worker object to query.
+ * @param [in]  dev_names         Array of device names, as they appear in
+ *                                UCX_NET_DEVICES (e.g. "mlx5_0").
+ * @param [in]  num_dev_names     Number of entries in @a dev_names; must be
+ *                                greater than zero.
+ * @param [out] address_p         Filled with the packed worker address.
+ * @param [out] address_length_p  Filled with the address length in bytes.
+ *
+ * @return UCS_OK on success, UCS_ERR_NO_DEVICE if no named device is usable,
+ *         or an error status otherwise.
+ */
+ucs_status_t ucp_worker_get_address_with_devices(
+        ucp_worker_h worker, const char *const *dev_names,
+        unsigned num_dev_names, ucp_address_t **address_p,
+        size_t *address_length_p);
+
+
+/**
+ * @ingroup UCP_WORKER
+ * @brief Stop using a local device for any future lane selection.
+ *
+ * Removes @a dev_name's transport resources from the set every subsequent
+ * endpoint draws from, on this worker's context. Endpoints already created keep
+ * their lanes; this affects selection from here on.
+ *
+ * Withdrawing a device from a published worker address (@ref
+ * ucp_worker_get_address_with_devices) is not sufficient by itself. That stops
+ * peers writing to the device, but this worker still selects it for its own
+ * outbound wireup: IB port state is read at device init, so a port that dies
+ * later still looks usable to selection, and the UD connect for wireup fails
+ * against it indefinitely. Both calls together are what fully retires a NIC.
+ *
+ * Not reversible -- restoring a device requires a new context, the same
+ * constraint UCX_NET_DEVICES has.
+ *
+ * @param [in] worker    Worker whose context should stop using the device.
+ * @param [in] dev_name  Device name as it appears in UCX_NET_DEVICES.
+ *
+ * @return UCS_OK on success, UCS_ERR_NO_ELEM if the device has no resources on
+ *         this context.
+ */
+ucs_status_t ucp_worker_exclude_device(ucp_worker_h worker,
+                                       const char *dev_name);
 
 
 /**

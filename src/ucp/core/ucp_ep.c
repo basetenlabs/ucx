@@ -1121,6 +1121,7 @@ ucp_ep_create_api_to_worker_addr(ucp_worker_h worker,
     unsigned addr_indices[UCP_MAX_LANES];
     ucp_unpacked_address_t remote_address;
     ucp_ep_match_conn_sn_t conn_sn;
+    ucp_tl_bitmap_t local_tl_bitmap;
     ucs_status_t status;
     unsigned flags;
     ucp_ep_h ep;
@@ -1166,7 +1167,33 @@ ucp_ep_create_api_to_worker_addr(ucp_worker_h worker,
         goto out_resolve_remote_id;
     }
 
-    status = ucp_ep_create_to_worker_addr(worker, &ucp_tl_bitmap_max,
+    /* Restrict this endpoint's lanes to one local device when the caller asked
+     * for it. UCX_NET_DEVICES cannot express this: it is read once at context
+     * creation and therefore applies to every endpoint on the worker. Pinning
+     * per endpoint is what lets an application attribute a transport failure to
+     * a specific NIC and rebuild on a different one.
+     *
+     * A named device with no usable resources is an error rather than a
+     * fallback: silently choosing another device would hide exactly the
+     * condition the caller is trying to control.
+     */
+    if (params->field_mask & UCP_EP_PARAM_FIELD_LOCAL_DEVICE) {
+        ucp_context_dev_tl_bitmap(worker->context, params->local_device,
+                                  &local_tl_bitmap);
+        if (UCS_STATIC_BITMAP_IS_ZERO(local_tl_bitmap)) {
+            ucs_error("ucp_ep_create: local device '%s' has no usable transport"
+                      " resources on worker %p",
+                      params->local_device, worker);
+            status = UCS_ERR_NO_DEVICE;
+            goto out_free_address;
+        }
+        ucs_debug("ucp_ep_create: restricting lanes to local device '%s'",
+                  params->local_device);
+    } else {
+        local_tl_bitmap = ucp_tl_bitmap_max;
+    }
+
+    status = ucp_ep_create_to_worker_addr(worker, &local_tl_bitmap,
                                           &remote_address, ep_init_flags,
                                           "from api call", addr_indices, &ep);
     if (status != UCS_OK) {

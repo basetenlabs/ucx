@@ -788,6 +788,26 @@ typedef struct ucp_ep_params {
      */
     ucs_sock_addr_t         local_sockaddr;
 
+    /**
+     * Name of the local device this endpoint's lanes must be selected from,
+     * as reported by @ref ucp_ep_query in @ref ucp_ep_attr_t::transports
+     * (for example "mlx5_bond_0:1"). Restricts lane selection for this
+     * endpoint only, leaving other endpoints on the same worker unaffected --
+     * unlike UCX_NET_DEVICES, which is a worker-wide setting fixed at context
+     * creation.
+     *
+     * The intended use is application-level NIC failover: an endpoint pinned
+     * to a known device makes a transport failure attributable to that device,
+     * so a replacement endpoint can be created on a different one.
+     *
+     * This setting is optional. To enable it, the corresponding - @ref
+     * UCP_EP_PARAM_FIELD_LOCAL_DEVICE bit in the field mask must be set. If
+     * the named device has no usable transport resources, endpoint creation
+     * fails with UCS_ERR_NO_DEVICE rather than silently falling back to
+     * another device, since a silent fallback would defeat the purpose.
+     */
+    const char              *local_device;
+
 } ucp_ep_params_t;
 
 

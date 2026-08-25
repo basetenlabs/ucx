@@ -440,6 +440,12 @@ typedef struct ucp_context {
     ucp_tl_bitmap_t               tl_bitmap;  /* Cached map of tl resources used by workers.
                                                * Not all resources may be used if unified
                                                * mode is enabled. */
+    /* Resources retired at runtime (ucp_worker_exclude_device). Kept separate
+     * from tl_bitmap on purpose: that one is also the index map for
+     * worker->ifaces (see ucp_worker_iface), so clearing a bit there shifts
+     * every later iface index and corrupts the lookup. This mask only filters
+     * selection. */
+    ucp_tl_bitmap_t               excluded_tl_bitmap;
     ucp_rsc_index_t               num_tls;    /* Number of resources in the array */
     ucp_proto_id_mask_t           proto_bitmap;  /* Enabled protocols */
 
