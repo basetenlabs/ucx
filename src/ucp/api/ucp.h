@@ -17,6 +17,8 @@
 #include <ucs/config/types.h>
 #include <ucs/sys/compiler_def.h>
 #include <ucs/memory/memory_type.h>
+#include <ucs/sys/topo/base/topo.h>
+#include <uct/api/uct_def.h>
 #include <stdio.h>
 #include <sys/types.h>
 
@@ -269,9 +271,13 @@ enum ucp_ep_params_field {
     UCP_EP_PARAM_FIELD_CONN_REQUEST      = UCS_BIT(6),
     UCP_EP_PARAM_FIELD_NAME              = UCS_BIT(7), /**< Endpoint name */
     UCP_EP_PARAM_FIELD_LOCAL_SOCK_ADDR   = UCS_BIT(8), /**< Local socket Address */
-    UCP_EP_PARAM_FIELD_LOCAL_DEVICE      = UCS_BIT(9)  /**< Local device name to
+    UCP_EP_PARAM_FIELD_LOCAL_DEVICE      = UCS_BIT(9), /**< Local device name to
                                                             restrict this
                                                             endpoint's lanes to */
+    UCP_EP_PARAM_FIELD_PATH              = UCS_BIT(10) /**< Both ends of the
+                                                            one path this
+                                                            endpoint's lanes
+                                                            take */
 };
 
 
@@ -2394,6 +2400,144 @@ void ucp_worker_destroy(ucp_worker_h worker);
  */
 ucs_status_t ucp_worker_query(ucp_worker_h worker,
                               ucp_worker_attr_t *attr);
+
+
+/**
+ * @ingroup UCP_WORKER
+ * @brief Attributes of one transport resource of a worker.
+ *
+ * Describes a single transport on a single device, as
+ * @ref ucp_worker_query_devices reports it. Several transports of the same
+ * device share one @ref ucp_worker_device_attr_t::dev_index.
+ */
+typedef struct ucp_worker_device_attr {
+    /** Device name, in the form accepted by @ref ucp_ep_params_t::local_device,
+        for example "mlx5_bond_0:1" */
+    char             dev_name[UCT_DEVICE_NAME_MAX];
+    /** Transport name, for example "rc_mlx5" */
+    char             tl_name[UCT_TL_NAME_MAX];
+    /** Index of the device among this worker's devices. It groups the entries
+        of one device and is local to this worker: it is unrelated to the index
+        a peer assigns to the same device in @ref ucp_address_device_attr_t */
+    unsigned         dev_index;
+    /** System device identifier, to be passed to ucs_topo_get_distance */
+    ucs_sys_device_t sys_device;
+    /** Interface capability flags, UCT_IFACE_FLAG_xx */
+    uint64_t         cap_flags;
+    /** Interface bandwidth, dedicated and shared parts together, in bytes per
+        second */
+    double           bandwidth;
+    /** Interface latency with no endpoints open, in seconds */
+    double           latency;
+    /** Message overhead, in seconds */
+    double           overhead;
+    /** Number of network paths the device exposes */
+    unsigned         num_paths;
+    /** Largest message the interface receives in one segment, in bytes */
+    size_t           seg_size;
+} ucp_worker_device_attr_t;
+
+
+/**
+ * @ingroup UCP_WORKER
+ * @brief Report the transport resources this worker can select lanes from.
+ *
+ * Fills @a devices with one entry per usable transport resource of the worker,
+ * so an application can name a device in @ref ucp_ep_params_t::local_device and
+ * reason about its bandwidth, latency and topology placement beforehand. A
+ * device excluded from lane selection at runtime is not reported.
+ *
+ * The caller owns @a devices; there is no matching release routine.
+ *
+ * @param [in]     worker         Worker object to query.
+ * @param [out]    devices        Array filled with the worker's resources, or
+ *                                NULL to query their number only.
+ * @param [in,out] num_devices_p  On input, the number of entries @a devices can
+ *                                hold. On output, the number of entries filled,
+ *                                or, if the array is too small, the number
+ *                                needed.
+ *
+ * @return UCS_OK on success, UCS_ERR_BUFFER_TOO_SMALL if @a devices is too
+ *         small to hold every entry, in which case @a num_devices_p holds the
+ *         required number.
+ */
+ucs_status_t ucp_worker_query_devices(ucp_worker_h worker,
+                                      ucp_worker_device_attr_t *devices,
+                                      unsigned *num_devices_p);
+
+
+/**
+ * @ingroup UCP_WORKER
+ * @brief Attributes of one transport resource of a remote worker.
+ *
+ * Describes a single entry of a packed worker address, as
+ * @ref ucp_address_query_devices reports it.
+ */
+typedef struct ucp_address_device_attr {
+    /** Index of the peer device this entry belongs to. This is the value to
+        pass in @ref ucp_ep_params_t::remote_device to restrict an endpoint to
+        this device, and it is meaningful only for the address it was read
+        from */
+    unsigned         dev_index;
+    /** Peer's system device identifier */
+    ucs_sys_device_t sys_dev;
+    /** Number of network paths the peer device exposes */
+    unsigned         num_paths;
+    /** Checksum of the transport name, as carried in the address */
+    uint16_t         tl_name_csum;
+    /** Peer device address. It points into the address blob passed to
+        @ref ucp_address_query_devices and is valid while that blob is */
+    const void      *dev_addr;
+    /** Peer device address length */
+    size_t           dev_addr_len;
+    /** Peer interface bandwidth, in bytes per second */
+    double           bandwidth;
+    /** Peer interface latency, in seconds */
+    double           latency;
+    /** Peer interface message overhead, in seconds */
+    double           overhead;
+    /** Largest message the peer interface receives in one segment, in bytes */
+    size_t           seg_size;
+    /** Peer interface capability and event flags */
+    uint64_t         flags;
+    /** Bit i is set if the local device whose
+        @ref ucp_worker_device_attr_t::dev_index is i can reach this entry */
+    uint64_t         reachable_dev_bitmap;
+} ucp_address_device_attr_t;
+
+
+/**
+ * @ingroup UCP_WORKER
+ * @brief Report the devices a remote worker address advertises.
+ *
+ * Unpacks @a address and fills @a entries with one entry per transport
+ * resource it carries, so an application can choose a peer device, name it in
+ * @ref ucp_ep_params_t::remote_device, and know beforehand which of its own
+ * devices reach it.
+ *
+ * The caller owns @a entries; there is no matching release routine. Entries
+ * point into @a address, so @a address must outlive them.
+ *
+ * @param [in]     worker         Worker whose devices the reachability is
+ *                                reported for.
+ * @param [in]     address        Remote worker address, as obtained from
+ *                                @ref ucp_worker_query with the
+ *                                @ref UCP_WORKER_ATTR_FIELD_ADDRESS field.
+ * @param [out]    entries        Array filled with the address entries, or NULL
+ *                                to query their number only.
+ * @param [in,out] num_entries_p  On input, the number of entries @a entries can
+ *                                hold. On output, the number of entries filled,
+ *                                or, if the array is too small, the number
+ *                                needed.
+ *
+ * @return UCS_OK on success, UCS_ERR_BUFFER_TOO_SMALL if @a entries is too
+ *         small to hold every entry, in which case @a num_entries_p holds the
+ *         required number, or an error from unpacking @a address.
+ */
+ucs_status_t ucp_address_query_devices(ucp_worker_h worker,
+                                       const ucp_address_t *address,
+                                       ucp_address_device_attr_t *entries,
+                                       unsigned *num_entries_p);
 
 
 /**

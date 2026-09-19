@@ -164,6 +164,13 @@ typedef struct {
 } ucp_wireup_select_info_t;
 
 
+/* Whether the peer aimed a request at one of its devices, which is the only
+ * evidence on the wire that it pinned its own end. dev_index is dense within a
+ * single unpacked address (ucp_address_get_remote_device_index), so a peer that
+ * offered more than one device has an entry with a non-zero index. */
+int ucp_wireup_address_is_single_device(const ucp_unpacked_address_t *address);
+
+
 ucs_status_t ucp_wireup_send_request(ucp_ep_h ep);
 
 ucs_status_t ucp_wireup_send_pre_request(ucp_ep_h ep);
@@ -198,6 +205,14 @@ ucp_wireup_msg_prepare(ucp_ep_h ep, uint8_t type,
                        size_t *address_length_p);
 
 int ucp_wireup_msg_ack_cb_pred(const ucs_callbackq_elem_t *elem, void *arg);
+
+/* Whether @a rsc_index of @a worker can reach the peer interface described by
+ * @a ae. Takes a worker rather than an endpoint, so it can also answer for a
+ * peer address no endpoint was created to yet */
+int ucp_wireup_worker_is_reachable(ucp_worker_h worker, unsigned ep_init_flags,
+                                   ucp_rsc_index_t rsc_index,
+                                   const ucp_address_entry_t *ae,
+                                   char *info_str, size_t info_str_size);
 
 int ucp_wireup_is_reachable(ucp_ep_h ep, unsigned ep_init_flags,
                             ucp_rsc_index_t rsc_index,
