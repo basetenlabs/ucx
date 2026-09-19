@@ -370,7 +370,7 @@ int ucp_wireup_connect_p2p(ucp_worker_h worker, ucp_rsc_index_t rsc_index,
  * could be multiple ep addresses per entry). This selection is used to create
  * 'lanes2remote' mapping with the remote lane index for each local lane.
  */
-static void
+static ucs_status_t
 ucp_wireup_match_p2p_lanes(ucp_ep_h ep,
                            const ucp_unpacked_address_t *remote_address,
                            const unsigned *addr_indices,
@@ -409,11 +409,17 @@ ucp_wireup_match_p2p_lanes(ucp_ep_h ep,
         address_index      = addr_indices[lane];
         address            = &remote_address->address_list[address_index];
         ep_addr_index      = ep_addr_indexes[address_index]++;
-        ucs_assertv(ep_addr_index < address->num_ep_addrs,
-                    "lane=%d/%d tl_name_csum=0x%02x address_index=%u "
-                    "ep_addr_index=%u num_ep_addrs=%u",
-                    lane, num_lanes, address->tl_name_csum, address_index,
-                    ep_addr_index, address->num_ep_addrs);
+        /* An entry with no ep address left for this lane cannot be connected.
+         * Reporting it is what keeps a release build, where an assertion is
+         * compiled out, from reading ep_addrs[] past its end. */
+        if (ep_addr_index >= address->num_ep_addrs) {
+            ucs_error("ep %p: lane=%d/%d tl_name_csum=0x%02x address_index=%u "
+                      "ep_addr_index=%u num_ep_addrs=%u: the selection takes "
+                      "more p2p lanes than this entry can address",
+                      ep, lane, num_lanes, address->tl_name_csum, address_index,
+                      ep_addr_index, address->num_ep_addrs);
+            return UCS_ERR_UNREACHABLE;
+        }
         remote_lane        = address->ep_addrs[ep_addr_index].lane;
         lanes2remote[lane] = remote_lane;
 
@@ -426,6 +432,8 @@ ucp_wireup_match_p2p_lanes(ucp_ep_h ep,
         ucs_trace("ep %p: lane[%d]->remote_lane[%d] (address[%d].ep_address[%d])",
                   ep, lane, remote_lane, address_index, ep_addr_index);
     }
+
+    return UCS_OK;
 }
 
 static ucs_status_t
@@ -648,8 +656,10 @@ ucp_wireup_process_pre_request(ucp_worker_h worker, ucp_ep_h ep,
        this point */
     ucp_ep_update_remote_id(ep, msg->src_ep_id);
 
-    /* initialize transport endpoints */
-    status = ucp_wireup_init_lanes(ep, ep_init_flags, &ucp_tl_bitmap_max,
+    /* initialize transport endpoints; re-selection stays inside the devices the
+       endpoint was pinned to, and is unrestricted for every other endpoint */
+    status = ucp_wireup_init_lanes(ep, ep_init_flags,
+                                   ucp_ep_dev_restriction_tls(ep),
                                    remote_address, addr_indices,
                                    &am_need_flush);
     if (status != UCS_OK) {
@@ -663,10 +673,69 @@ err_ep_set_failed:
     ucp_ep_set_lanes_failed_schedule(ep, 0, status);
 }
 
+int ucp_wireup_address_is_single_device(const ucp_unpacked_address_t *address)
+{
+    const ucp_address_entry_t *ae;
+
+    if (address->address_count == 0) {
+        return 0;
+    }
+
+    ucp_unpacked_address_for_each(ae, address) {
+        if (ae->dev_index != 0) {
+            return 0;
+        }
+    }
+
+    return 1;
+}
+
+/* Confine an endpoint this handler just created to the device the request
+ * arrived on. The peer built its auxiliary endpoint from a single-device
+ * address, so the arrival device is the device it dialled; without this the
+ * receiver selects over every device and the pair the peer chose is lost for
+ * the reply, for the lanes, and for any rendezvous the peer later pulls over
+ * this endpoint. Returns whether the endpoint ended up pinned. */
+static int
+ucp_wireup_pin_to_arrival_device(ucp_worker_h worker, ucp_ep_h ep,
+                                 ucp_rsc_index_t arrival_rsc_index,
+                                 const ucp_unpacked_address_t *remote_address)
+{
+    ucp_context_h context = worker->context;
+    ucp_ep_dev_restriction_t restriction;
+
+    if (!context->config.ext.wireup_pin_to_arrival_device ||
+        !ucp_wireup_address_is_single_device(remote_address)) {
+        return 0;
+    }
+
+    if (ucp_ep_dev_restriction_from_iface(worker, arrival_rsc_index,
+                                          &restriction) != UCS_OK) {
+        /* Widening keeps unrelated traffic on this worker alive; the peer's own
+         * readback of the port it was answered on is what turns this into a
+         * failure on the side that asked for the pair */
+        ucs_error("ep %p: wireup request from '%s' arrived on "
+                  UCT_TL_RESOURCE_DESC_FMT ", which has no usable data"
+                  " transport; selecting over all devices instead",
+                  ep, remote_address->name,
+                  UCT_TL_RESOURCE_DESC_ARG(
+                          &context->tl_rscs[arrival_rsc_index].tl_rsc));
+        return 0;
+    }
+
+    ucp_ep_dev_restriction_store(ep, &restriction);
+    ucs_debug("ep %p: pinned to the device wireup request from '%s' arrived on,"
+              " " UCT_TL_RESOURCE_DESC_FMT, ep, remote_address->name,
+              UCT_TL_RESOURCE_DESC_ARG(
+                      &context->tl_rscs[arrival_rsc_index].tl_rsc));
+    return 1;
+}
+
 static UCS_F_NOINLINE void
 ucp_wireup_process_request(ucp_worker_h worker, ucp_ep_h ep,
                            const ucp_wireup_msg_t *msg,
-                           const ucp_unpacked_address_t *remote_address)
+                           const ucp_unpacked_address_t *remote_address,
+                           ucp_rsc_index_t arrival_rsc_index)
 {
     uint64_t remote_uuid      = remote_address->uuid;
     int send_reply            = 0;
@@ -676,6 +745,7 @@ ucp_wireup_process_request(ucp_worker_h worker, ucp_ep_h ep,
     unsigned addr_indices[UCP_MAX_LANES];
     ucs_status_t status;
     int has_cm_lane, am_need_flush, full_handshake_required;
+    int ep_created = 0;
 
     UCP_WIREUP_MSG_CHECK(msg, ep, UCP_WIREUP_MSG_REQUEST);
     ucs_trace("got wireup request from 0x%"PRIx64" src_ep_id 0x%"PRIx64
@@ -702,6 +772,8 @@ ucp_wireup_process_request(ucp_worker_h worker, ucp_ep_h ep,
             if (status != UCS_OK) {
                 return;
             }
+
+            ep_created = 1;
 
             /* add internal endpoint to hash */
             ep->conn_sn = msg->conn_sn;
@@ -744,15 +816,31 @@ ucp_wireup_process_request(ucp_worker_h worker, ucp_ep_h ep,
         ep_init_flags |= UCP_EP_INIT_CM_WIREUP_SERVER;
     }
 
-    /* Initialize lanes (possible destroy existing lanes) */
-    status = ucp_wireup_init_lanes(ep, ep_init_flags, &ucp_tl_bitmap_max,
+    /* Only an endpoint this handler created has no restriction of its own to
+       lose: one retrieved above was created and pinned by this worker, and one
+       passed in by dst_ep_id already has its lanes */
+    if (ep_created &&
+        ucp_wireup_pin_to_arrival_device(worker, ep, arrival_rsc_index,
+                                         remote_address)) {
+        ep_init_flags |= UCP_EP_INIT_KA_FROM_EXIST_LANES;
+    }
+
+    /* Initialize lanes (possible destroy existing lanes). The endpoint here can
+       be one this worker created and pinned, retrieved from the expected queue
+       above, so its restriction has to survive the re-selection */
+    status = ucp_wireup_init_lanes(ep, ep_init_flags,
+                                   ucp_ep_dev_restriction_tls(ep),
                                    remote_address, addr_indices,
                                    &am_need_flush);
     if (status != UCS_OK) {
         goto err_set_ep_failed;
     }
 
-    ucp_wireup_match_p2p_lanes(ep, remote_address, addr_indices, lanes2remote);
+    status = ucp_wireup_match_p2p_lanes(ep, remote_address, addr_indices,
+                                        lanes2remote);
+    if (status != UCS_OK) {
+        goto err_set_ep_failed;
+    }
 
     /* Full handshake is required in the following cases:
      * 1) CM flow (the client's EP has to be marked as REMOTE_CONNECTED)
@@ -1047,9 +1135,10 @@ ucp_wireup_process_lanes_addr_reply(
 static ucs_status_t ucp_wireup_msg_handler(void *arg, void *data,
                                            size_t length, unsigned flags)
 {
-    ucp_worker_h worker   = arg;
-    ucp_wireup_msg_t *msg = data;
-    ucp_ep_h ep           = NULL;
+    ucp_worker_iface_t *wiface = arg;
+    ucp_worker_h worker        = wiface->worker;
+    ucp_wireup_msg_t *msg      = data;
+    ucp_ep_h ep                = NULL;
     void *address_ptr;
     ucp_unpacked_address_t remote_address;
     ucs_status_t status;
@@ -1090,7 +1179,8 @@ static ucs_status_t ucp_wireup_msg_handler(void *arg, void *data,
     } else if (msg->type == UCP_WIREUP_MSG_PRE_REQUEST) {
         ucp_wireup_process_pre_request(worker, ep, msg, &remote_address);
     } else if (msg->type == UCP_WIREUP_MSG_REQUEST) {
-        ucp_wireup_process_request(worker, ep, msg, &remote_address);
+        ucp_wireup_process_request(worker, ep, msg, &remote_address,
+                                   wiface->rsc_index);
     } else if (msg->type == UCP_WIREUP_MSG_REPLY) {
         ucp_wireup_process_reply(worker, ep, msg, &remote_address);
     } else if (msg->type == UCP_WIREUP_MSG_REPLY_RECONFIG) {
@@ -1415,13 +1505,13 @@ static void ucp_wireup_print_config(ucp_worker_h worker,
             key->flags);
 }
 
-int ucp_wireup_is_reachable(ucp_ep_h ep, unsigned ep_init_flags,
-                            ucp_rsc_index_t rsc_index,
-                            const ucp_address_entry_t *ae,
-                            char *info_str, size_t info_str_size)
+int ucp_wireup_worker_is_reachable(ucp_worker_h worker, unsigned ep_init_flags,
+                                   ucp_rsc_index_t rsc_index,
+                                   const ucp_address_entry_t *ae,
+                                   char *info_str, size_t info_str_size)
 {
-    ucp_context_h context      = ep->worker->context;
-    ucp_worker_iface_t *wiface = ucp_worker_iface(ep->worker, rsc_index);
+    ucp_context_h context      = worker->context;
+    ucp_worker_iface_t *wiface = ucp_worker_iface(worker, rsc_index);
     uct_iface_is_reachable_params_t params = {
         .field_mask         = UCT_IFACE_IS_REACHABLE_FIELD_DEVICE_ADDR |
                               UCT_IFACE_IS_REACHABLE_FIELD_IFACE_ADDR |
@@ -1449,6 +1539,15 @@ int ucp_wireup_is_reachable(ucp_ep_h ep, unsigned ep_init_flags,
      * during CM phase */
     return (ep_init_flags & UCP_EP_INIT_CM_PHASE) ||
            uct_iface_is_reachable_v2(wiface->iface, &params);
+}
+
+int ucp_wireup_is_reachable(ucp_ep_h ep, unsigned ep_init_flags,
+                            ucp_rsc_index_t rsc_index,
+                            const ucp_address_entry_t *ae, char *info_str,
+                            size_t info_str_size)
+{
+    return ucp_wireup_worker_is_reachable(ep->worker, ep_init_flags, rsc_index,
+                                          ae, info_str, info_str_size);
 }
 
 static void
@@ -2394,6 +2493,13 @@ unsigned ucp_ep_init_flags(const ucp_worker_h worker,
         flags |= UCP_EP_INIT_CREATE_AM_LANE;
     }
 
+    if (params->field_mask & UCP_EP_PARAM_FIELD_PATH) {
+        /* The keepalive may otherwise pick an auxiliary transport on the pinned
+           port: the same port as the data lane but a different QP, so it proves
+           the port while the QP carrying the bytes is dead */
+        flags |= UCP_EP_INIT_KA_FROM_EXIST_LANES;
+    }
+
     return flags |
            ucp_ep_err_mode_init_flags(ucp_ep_params_err_handling_mode(params));
 }
@@ -2430,5 +2536,5 @@ double ucp_wireup_iface_bw_distance(const ucp_worker_iface_t *wiface)
     return ucp_tl_iface_bandwidth(context, &bandwidth);
 }
 
-UCP_DEFINE_AM(UINT64_MAX, UCP_AM_ID_WIREUP, ucp_wireup_msg_handler,
-              ucp_wireup_msg_dump, UCT_CB_FLAG_ASYNC);
+UCP_DEFINE_AM_WITH_IFACE(UINT64_MAX, UCP_AM_ID_WIREUP, ucp_wireup_msg_handler,
+                         ucp_wireup_msg_dump, UCT_CB_FLAG_ASYNC);

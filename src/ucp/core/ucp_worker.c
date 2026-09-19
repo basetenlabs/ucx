@@ -214,10 +214,11 @@ static void ucp_worker_set_am_handlers(ucp_worker_iface_t *wiface, int is_proxy)
                                               wiface,
                                               ucp_am_handlers[am_id]->flags);
         } else {
-            status = uct_iface_set_am_handler(wiface->iface, am_id,
-                                              ucp_am_handlers[am_id]->cb,
-                                              worker,
-                                              ucp_am_handlers[am_id]->flags);
+            status = uct_iface_set_am_handler(
+                    wiface->iface, am_id, ucp_am_handlers[am_id]->cb,
+                    ucp_am_handlers[am_id]->iface_arg ? (void*)wiface :
+                                                        (void*)worker,
+                    ucp_am_handlers[am_id]->flags);
         }
         if (status != UCS_OK) {
             ucs_fatal("failed to set active message handler id %d: %s", am_id,
@@ -3187,6 +3188,58 @@ ucs_status_t ucp_worker_query(ucp_worker_h worker,
     }
 
     return status;
+}
+
+ucs_status_t ucp_worker_query_devices(ucp_worker_h worker,
+                                      ucp_worker_device_attr_t *devices,
+                                      unsigned *num_devices_p)
+{
+    ucp_context_h context      = worker->context;
+    unsigned max_devices       = *num_devices_p;
+    unsigned num_devices       = 0;
+    ucp_tl_bitmap_t tl_bitmap  = context->tl_bitmap;
+    const ucp_tl_resource_desc_t *rsc;
+    const uct_iface_attr_t *iface_attr;
+    ucp_worker_device_attr_t *device;
+    ucp_rsc_index_t tl_id;
+
+    /* A device retired with ucp_worker_exclude_device is not reported, for the
+     * same reason it is not advertised in the address: it is no longer a lane
+     * selection candidate, so naming it in ucp_ep_params_t::local_device would
+     * only fail.
+     */
+    UCS_STATIC_BITMAP_AND_INPLACE(
+            &tl_bitmap, UCS_STATIC_BITMAP_NOT(context->excluded_tl_bitmap));
+
+    UCS_STATIC_BITMAP_FOR_EACH_BIT(tl_id, &tl_bitmap) {
+        ++num_devices;
+        if ((devices == NULL) || (num_devices > max_devices)) {
+            continue;
+        }
+
+        rsc        = &context->tl_rscs[tl_id];
+        iface_attr = ucp_worker_iface_get_attr(worker, tl_id);
+        device     = &devices[num_devices - 1];
+
+        ucs_strncpy_safe(device->dev_name, rsc->tl_rsc.dev_name,
+                         UCT_DEVICE_NAME_MAX);
+        ucs_strncpy_safe(device->tl_name, rsc->tl_rsc.tl_name, UCT_TL_NAME_MAX);
+        device->dev_index  = rsc->dev_index;
+        device->sys_device = rsc->tl_rsc.sys_device;
+        device->cap_flags  = iface_attr->cap.flags;
+        device->bandwidth  = ucp_tl_iface_bandwidth(context,
+                                                    &iface_attr->bandwidth);
+        /* The constant part of the latency function, which is its value with no
+           endpoint open on the interface */
+        device->latency    = iface_attr->latency.c;
+        device->overhead   = iface_attr->overhead;
+        device->num_paths  = iface_attr->dev_num_paths;
+        device->seg_size   = ucp_address_iface_seg_size(iface_attr);
+    }
+
+    *num_devices_p = num_devices;
+    return ((devices == NULL) || (num_devices <= max_devices)) ?
+           UCS_OK : UCS_ERR_BUFFER_TOO_SMALL;
 }
 
 ucs_status_t ucp_worker_address_query(ucp_address_t *address,
