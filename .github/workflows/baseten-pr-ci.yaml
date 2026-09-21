@@ -1,0 +1,36 @@
+name: Baseten PR CI
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-smoke:
+    name: CPU build + ucx_info smoke test
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            autoconf automake libtool pkg-config libnuma-dev
+
+      - name: Configure (release, CPU-only)
+        run: |
+          ./autogen.sh
+          ./contrib/configure-release --without-verbs
+
+      - name: Build
+        run: make -j"$(nproc)"
+
+      - name: Smoke test (ucx_info)
+        run: |
+          ./src/tools/info/ucx_info -v
+          ./src/tools/info/ucx_info -d
