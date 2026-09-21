@@ -274,6 +274,8 @@ static ucp_ep_h ucp_ep_allocate(ucp_worker_h worker, const char *peer_name)
     ep->ext->fence_seq                    = 0;
     ep->ext->uct_eps                      = NULL;
     ep->ext->flush_sys_dev_map            = 0;
+    ep->ext->dev_restriction.tls          = ucp_tl_bitmap_max;
+    ep->ext->dev_restriction.remote_devs  = UINT64_MAX;
 
     UCS_STATIC_ASSERT(sizeof(ep->ext->ep_match) >=
                       sizeof(ep->ext->flush_state));
@@ -780,7 +782,7 @@ ucs_status_t ucp_worker_mem_type_eps_create(ucp_worker_h worker)
          * INTERNAL flag (setting EP flags is expected to be guarded) */
         UCS_ASYNC_BLOCK(&worker->async);
         status = ucp_ep_create_to_worker_addr(worker, &ucp_tl_bitmap_max,
-                                              &local_address,
+                                              NULL, &local_address,
                                               UCP_EP_INIT_FLAG_MEM_TYPE |
                                               UCP_EP_INIT_FLAG_INTERNAL,
                                               ep_name, addr_indices,
@@ -885,9 +887,112 @@ static ucs_status_t ucp_ep_init_create_wireup(ucp_ep_h ep,
     return UCS_OK;
 }
 
+/* Whether the caller asked for any device restriction. Read from the params
+ * rather than from the record, because the answer is needed before the record
+ * can be filled */
+static int ucp_ep_params_dev_restricted(const ucp_ep_params_t *params)
+{
+    return !!(params->field_mask & (UCP_EP_PARAM_FIELD_LOCAL_DEVICE |
+                                    UCP_EP_PARAM_FIELD_PATH));
+}
+
+ucs_status_t
+ucp_ep_dev_restriction_init(ucp_ep_dev_restriction_t *restriction,
+                            const ucp_ep_params_t *params,
+                            const ucp_tl_bitmap_t *local_tl_bitmap,
+                            const ucp_unpacked_address_t *remote_address)
+{
+    const ucp_address_entry_t *ae;
+
+    restriction->tls         = *local_tl_bitmap;
+    restriction->remote_devs = UINT64_MAX;
+
+    if (!(params->field_mask & UCP_EP_PARAM_FIELD_PATH)) {
+        return UCS_OK;
+    }
+
+    /* Lane selection carries the peer's devices as a 64-bit mask, so an index
+     * it cannot hold is rejected here rather than silently wrapping */
+    if (params->path.remote_dev_index >= 64) {
+        ucs_error("ucp_ep_create: remote device index %u is out of range",
+                  params->path.remote_dev_index);
+        return UCS_ERR_NO_DEVICE;
+    }
+
+    ucp_unpacked_address_for_each(ae, remote_address) {
+        if (ae->dev_index == params->path.remote_dev_index) {
+            restriction->remote_devs = UCS_BIT(params->path.remote_dev_index);
+            ucs_debug("ucp_ep_create: path is local device[%u] to remote "
+                      "device[%u]",
+                      params->path.local_dev_index,
+                      params->path.remote_dev_index);
+            return UCS_OK;
+        }
+    }
+
+    /* The index the caller passed came from a query over this very address, so
+     * an index missing from it means the two have gone out of sync */
+    ucs_error("ucp_ep_create: remote address of '%s' carries no device[%u]",
+              remote_address->name, params->path.remote_dev_index);
+    return UCS_ERR_NO_DEVICE;
+}
+
+ucs_status_t
+ucp_ep_dev_restriction_from_iface(ucp_worker_h worker,
+                                  ucp_rsc_index_t arrival_rsc_index,
+                                  ucp_ep_dev_restriction_t *restriction)
+{
+    ucp_context_h context = worker->context;
+    ucp_tl_bitmap_t tl_bitmap;
+    ucp_rsc_index_t tl_idx;
+
+    if (arrival_rsc_index == UCP_NULL_RESOURCE) {
+        return UCS_ERR_NO_DEVICE;
+    }
+
+    ucp_context_dev_idx_tl_bitmap(context,
+                                  context->tl_rscs[arrival_rsc_index].dev_index,
+                                  &tl_bitmap);
+    /* A device retired at runtime keeps its resources addressable but is no
+     * longer a candidate, so an arrival on it leaves nothing to select from */
+    UCS_STATIC_BITMAP_AND_INPLACE(
+            &tl_bitmap, UCS_STATIC_BITMAP_NOT(context->excluded_tl_bitmap));
+
+    /* An auxiliary resource carries wireup messages and no data, so a device
+     * offering only those cannot hold a lane. The context-wide check at
+     * ucp_check_resource_config() cannot answer this: it asks whether the
+     * worker has any data transport, not whether this one device does. */
+    UCS_STATIC_BITMAP_FOR_EACH_BIT(tl_idx, &tl_bitmap) {
+        if (!(context->tl_rscs[tl_idx].flags & UCP_TL_RSC_FLAG_AUX)) {
+            restriction->tls         = tl_bitmap;
+            restriction->remote_devs = UINT64_MAX;
+            return UCS_OK;
+        }
+    }
+
+    return UCS_ERR_NO_DEVICE;
+}
+
+void ucp_ep_dev_restriction_store(ucp_ep_h ep,
+                                  const ucp_ep_dev_restriction_t *restriction)
+{
+    ep->ext->dev_restriction = *restriction;
+}
+
+const ucp_tl_bitmap_t *ucp_ep_dev_restriction_tls(ucp_ep_h ep)
+{
+    return &ep->ext->dev_restriction.tls;
+}
+
+uint64_t ucp_ep_dev_restriction_remote(ucp_ep_h ep)
+{
+    return ep->ext->dev_restriction.remote_devs;
+}
+
 ucs_status_t
 ucp_ep_create_to_worker_addr(ucp_worker_h worker,
                              const ucp_tl_bitmap_t *local_tl_bitmap,
+                             const ucp_ep_dev_restriction_t *restriction,
                              const ucp_unpacked_address_t *remote_address,
                              unsigned ep_init_flags, const char *message,
                              unsigned *addr_indices, ucp_ep_h *ep_p)
@@ -902,6 +1007,13 @@ ucp_ep_create_to_worker_addr(ucp_worker_h worker,
                                 message, &ep);
     if (status != UCS_OK) {
         goto err;
+    }
+
+    /* Record the restriction before the first selection, not after it: the
+     * peer's device mask is read off the endpoint, so a record stored later
+     * would leave the first selection unrestricted */
+    if (restriction != NULL) {
+        ucp_ep_dev_restriction_store(ep, restriction);
     }
 
     /* initialize transport endpoints */
@@ -1121,6 +1233,8 @@ ucp_ep_create_api_to_worker_addr(ucp_worker_h worker,
     unsigned addr_indices[UCP_MAX_LANES];
     ucp_unpacked_address_t remote_address;
     ucp_ep_match_conn_sn_t conn_sn;
+    ucp_ep_dev_restriction_t restriction;
+    ucp_tl_bitmap_t local_tl_bitmap;
     ucs_status_t status;
     unsigned flags;
     ucp_ep_h ep;
@@ -1150,12 +1264,22 @@ ucp_ep_create_api_to_worker_addr(ucp_worker_h worker,
      * dest_ep_ptr will be initialized, a WIREUP_REQUEST (if sent) will have
      * dst_ep != 0. So, ucp_wireup_request() will not create an unexpected ep
      * in ep_match.
+     * A restricted endpoint takes none of them: an endpoint created by the
+     * peer's wireup is already connected, its lanes were selected over every
+     * device before this restriction was known, and the address they were
+     * selected from is freed by then, so the restriction cannot be applied to
+     * it afterwards.
      */
     conn_sn = ucp_ep_match_get_sn(worker, remote_address.uuid);
-    ep      = ucp_ep_match_retrieve(worker, remote_address.uuid,
-                                    conn_sn ^
-                                    (remote_address.uuid == worker->uuid),
-                                    UCS_CONN_MATCH_QUEUE_UNEXP);
+    if (ucp_ep_params_dev_restricted(params)) {
+        ep = NULL;
+    } else {
+        ep = ucp_ep_match_retrieve(worker, remote_address.uuid,
+                                   conn_sn ^
+                                   (remote_address.uuid == worker->uuid),
+                                   UCS_CONN_MATCH_QUEUE_UNEXP);
+    }
+
     if (ep != NULL) {
         status = ucp_ep_adjust_params(ep, params);
         if (status != UCS_OK) {
@@ -1166,7 +1290,50 @@ ucp_ep_create_api_to_worker_addr(ucp_worker_h worker,
         goto out_resolve_remote_id;
     }
 
-    status = ucp_ep_create_to_worker_addr(worker, &ucp_tl_bitmap_max,
+    /* Restrict this endpoint's lanes to one local device when the caller asked
+     * for it. UCX_NET_DEVICES cannot express this: it is read once at context
+     * creation and therefore applies to every endpoint on the worker. Pinning
+     * per endpoint is what lets an application attribute a transport failure to
+     * a specific NIC and rebuild on a different one.
+     *
+     * A named device with no usable resources is an error rather than a
+     * fallback: silently choosing another device would hide exactly the
+     * condition the caller is trying to control.
+     */
+    if (params->field_mask & UCP_EP_PARAM_FIELD_PATH) {
+        ucp_context_dev_idx_tl_bitmap(worker->context,
+                                      params->path.local_dev_index,
+                                      &local_tl_bitmap);
+        if (UCS_STATIC_BITMAP_IS_ZERO(local_tl_bitmap)) {
+            ucs_error("ucp_ep_create: local device[%u] has no usable transport"
+                      " resources on worker %p",
+                      params->path.local_dev_index, worker);
+            status = UCS_ERR_NO_DEVICE;
+            goto out_free_address;
+        }
+    } else if (params->field_mask & UCP_EP_PARAM_FIELD_LOCAL_DEVICE) {
+        ucp_context_dev_tl_bitmap(worker->context, params->local_device,
+                                  &local_tl_bitmap);
+        if (UCS_STATIC_BITMAP_IS_ZERO(local_tl_bitmap)) {
+            ucs_error("ucp_ep_create: local device '%s' has no usable transport"
+                      " resources on worker %p",
+                      params->local_device, worker);
+            status = UCS_ERR_NO_DEVICE;
+            goto out_free_address;
+        }
+        ucs_debug("ucp_ep_create: restricting lanes to local device '%s'",
+                  params->local_device);
+    } else {
+        local_tl_bitmap = ucp_tl_bitmap_max;
+    }
+
+    status = ucp_ep_dev_restriction_init(&restriction, params, &local_tl_bitmap,
+                                         &remote_address);
+    if (status != UCS_OK) {
+        goto out_free_address;
+    }
+
+    status = ucp_ep_create_to_worker_addr(worker, &local_tl_bitmap, &restriction,
                                           &remote_address, ep_init_flags,
                                           "from api call", addr_indices, &ep);
     if (status != UCS_OK) {

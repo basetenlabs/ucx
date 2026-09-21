@@ -282,7 +282,18 @@ static unsigned uct_ud_ep_deferred_timeout_handler(void *arg)
     }
 
     if (ep->flags & UCT_UD_EP_FLAG_PRIVATE) {
-        ucs_assert(ucs_queue_is_empty(&ep->tx.window));
+        /* A private EP exists because a peer sent us a CREQ, so its window
+         * holds the reply that peer never acked. A local device that loses
+         * its address produces exactly that state, and the EP then reaches
+         * this timeout with the window still occupied -- so the window being
+         * empty here is not an invariant to assert, it is a state to reach.
+         *
+         * Purge first, as the DISCONNECTED branch above does. Asserting it
+         * instead aborts the process where assertions are on, and where they
+         * are off (contrib/configure-release passes --disable-assertions)
+         * the assert vanishes and the EP is destroyed with its descriptors
+         * still queued, which is the quieter and worse of the two. */
+        uct_ud_ep_purge(ep, UCS_ERR_ENDPOINT_TIMEOUT);
         uct_ep_destroy(&ep->super.super);
         goto out;
     }

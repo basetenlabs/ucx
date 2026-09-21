@@ -287,7 +287,7 @@ void test_ucp_ep_reconfig::entity::connect(const ucp_test_base::entity *other,
     ucp_ep_h ucp_ep;
 
     UCS_ASYNC_BLOCK(&worker()->async);
-    ASSERT_UCS_OK(ucp_ep_create_to_worker_addr(worker(), &tl_bitmap,
+    ASSERT_UCS_OK(ucp_ep_create_to_worker_addr(worker(), &tl_bitmap, NULL,
                                                &worker_addr->second,
                                                UCP_EP_INIT_CREATE_AM_LANE,
                                                "reconfigure test", addr_indices,

@@ -214,10 +214,11 @@ static void ucp_worker_set_am_handlers(ucp_worker_iface_t *wiface, int is_proxy)
                                               wiface,
                                               ucp_am_handlers[am_id]->flags);
         } else {
-            status = uct_iface_set_am_handler(wiface->iface, am_id,
-                                              ucp_am_handlers[am_id]->cb,
-                                              worker,
-                                              ucp_am_handlers[am_id]->flags);
+            status = uct_iface_set_am_handler(
+                    wiface->iface, am_id, ucp_am_handlers[am_id]->cb,
+                    ucp_am_handlers[am_id]->iface_arg ? (void*)wiface :
+                                                        (void*)worker,
+                    ucp_am_handlers[am_id]->flags);
         }
         if (status != UCS_OK) {
             ucs_fatal("failed to set active message handler id %d: %s", am_id,
@@ -3103,22 +3104,33 @@ void ucp_worker_destroy(ucp_worker_h worker)
     ucs_free(worker);
 }
 
-static ucs_status_t ucp_worker_address_pack(ucp_worker_h worker,
-                                            uint32_t address_flags,
-                                            size_t *address_length_p,
-                                            void **address_p)
+static ucs_status_t
+ucp_worker_address_pack_bitmap(ucp_worker_h worker,
+                               const ucp_tl_bitmap_t *tl_bitmap,
+                               size_t *address_length_p, void **address_p)
 {
     ucp_context_h context = worker->context;
     unsigned flags        = ucp_worker_default_address_pack_flags(worker);
-    ucp_tl_bitmap_t tl_bitmap;
-    ucp_rsc_index_t tl_id;
-    const uct_iface_attr_t *iface_attr;
 
     /* Make sure that UUID is packed to the address intended for the user,
      * because ucp_worker_address_query routine assumes that uuid is always
      * packed.
      */
     ucs_assert(flags & UCP_ADDRESS_PACK_FLAG_WORKER_UUID);
+
+    return ucp_address_pack(worker, NULL, tl_bitmap, flags,
+                            context->config.ext.worker_addr_version, NULL,
+                            UINT_MAX, address_length_p, (void**)address_p);
+}
+
+static ucs_status_t ucp_worker_address_pack(ucp_worker_h worker,
+                                            uint32_t address_flags,
+                                            size_t *address_length_p,
+                                            void **address_p)
+{
+    ucp_tl_bitmap_t tl_bitmap;
+    ucp_rsc_index_t tl_id;
+    const uct_iface_attr_t *iface_attr;
 
     if (address_flags & UCP_WORKER_ADDRESS_FLAG_NET_ONLY) {
         UCS_STATIC_BITMAP_RESET_ALL(&tl_bitmap);
@@ -3132,9 +3144,17 @@ static ucs_status_t ucp_worker_address_pack(ucp_worker_h worker,
         UCS_STATIC_BITMAP_SET_ALL(&tl_bitmap);
     }
 
-    return ucp_address_pack(worker, NULL, &tl_bitmap, flags,
-                            context->config.ext.worker_addr_version, NULL,
-                            UINT_MAX, address_length_p, (void**)address_p);
+    /* A device retired with ucp_worker_exclude_device is not advertised either.
+     * Otherwise the two calls disagree: selection would refuse the device while
+     * the address kept inviting peers to it, which is the exact combination that
+     * strands traffic on a dead NIC.
+     */
+    UCS_STATIC_BITMAP_AND_INPLACE(
+            &tl_bitmap,
+            UCS_STATIC_BITMAP_NOT(worker->context->excluded_tl_bitmap));
+
+    return ucp_worker_address_pack_bitmap(worker, &tl_bitmap, address_length_p,
+                                          address_p);
 }
 
 ucs_status_t ucp_worker_query(ucp_worker_h worker,
@@ -3168,6 +3188,58 @@ ucs_status_t ucp_worker_query(ucp_worker_h worker,
     }
 
     return status;
+}
+
+ucs_status_t ucp_worker_query_devices(ucp_worker_h worker,
+                                      ucp_worker_device_attr_t *devices,
+                                      unsigned *num_devices_p)
+{
+    ucp_context_h context      = worker->context;
+    unsigned max_devices       = *num_devices_p;
+    unsigned num_devices       = 0;
+    ucp_tl_bitmap_t tl_bitmap  = context->tl_bitmap;
+    const ucp_tl_resource_desc_t *rsc;
+    const uct_iface_attr_t *iface_attr;
+    ucp_worker_device_attr_t *device;
+    ucp_rsc_index_t tl_id;
+
+    /* A device retired with ucp_worker_exclude_device is not reported, for the
+     * same reason it is not advertised in the address: it is no longer a lane
+     * selection candidate, so naming it in ucp_ep_params_t::local_device would
+     * only fail.
+     */
+    UCS_STATIC_BITMAP_AND_INPLACE(
+            &tl_bitmap, UCS_STATIC_BITMAP_NOT(context->excluded_tl_bitmap));
+
+    UCS_STATIC_BITMAP_FOR_EACH_BIT(tl_id, &tl_bitmap) {
+        ++num_devices;
+        if ((devices == NULL) || (num_devices > max_devices)) {
+            continue;
+        }
+
+        rsc        = &context->tl_rscs[tl_id];
+        iface_attr = ucp_worker_iface_get_attr(worker, tl_id);
+        device     = &devices[num_devices - 1];
+
+        ucs_strncpy_safe(device->dev_name, rsc->tl_rsc.dev_name,
+                         UCT_DEVICE_NAME_MAX);
+        ucs_strncpy_safe(device->tl_name, rsc->tl_rsc.tl_name, UCT_TL_NAME_MAX);
+        device->dev_index  = rsc->dev_index;
+        device->sys_device = rsc->tl_rsc.sys_device;
+        device->cap_flags  = iface_attr->cap.flags;
+        device->bandwidth  = ucp_tl_iface_bandwidth(context,
+                                                    &iface_attr->bandwidth);
+        /* The constant part of the latency function, which is its value with no
+           endpoint open on the interface */
+        device->latency    = iface_attr->latency.c;
+        device->overhead   = iface_attr->overhead;
+        device->num_paths  = iface_attr->dev_num_paths;
+        device->seg_size   = ucp_address_iface_seg_size(iface_attr);
+    }
+
+    *num_devices_p = num_devices;
+    return ((devices == NULL) || (num_devices <= max_devices)) ?
+           UCS_OK : UCS_ERR_BUFFER_TOO_SMALL;
 }
 
 ucs_status_t ucp_worker_address_query(ucp_address_t *address,
@@ -3431,6 +3503,112 @@ ucs_status_t ucp_worker_get_address(ucp_worker_h worker,
 
     UCP_WORKER_THREAD_CS_EXIT_CONDITIONAL(worker);
 
+    return status;
+}
+
+ucs_status_t ucp_worker_get_address_with_devices(
+        ucp_worker_h worker, const char *const *dev_names,
+        unsigned num_dev_names, ucp_address_t **address_p,
+        size_t *address_length_p)
+{
+    ucp_tl_bitmap_t tl_bitmap, dev_tl_bitmap;
+    ucs_status_t status;
+    unsigned i;
+
+    if ((dev_names == NULL) || (num_dev_names == 0)) {
+        ucs_error("ucp_worker_get_address_with_devices: no devices given");
+        return UCS_ERR_INVALID_PARAM;
+    }
+
+    UCP_WORKER_THREAD_CS_ENTER_CONDITIONAL(worker);
+
+    /* Advertise only the named devices. The peer chooses which of our NICs to
+     * write to purely from the address entries here, so restricting the address
+     * is the only way to keep it off a device we know is unusable -- lane
+     * selection has an equivalent remote_dev_bitmap internally, but it is not
+     * reachable from the API, and the address is what the peer actually holds.
+     */
+    UCS_STATIC_BITMAP_RESET_ALL(&tl_bitmap);
+    for (i = 0; i < num_dev_names; ++i) {
+        ucp_context_dev_tl_bitmap(worker->context, dev_names[i],
+                                  &dev_tl_bitmap);
+        if (UCS_STATIC_BITMAP_IS_ZERO(dev_tl_bitmap)) {
+            ucs_diag("ucp_worker_get_address_with_devices: device '%s' has no"
+                     " usable transport resources on worker %p",
+                     dev_names[i], worker);
+            continue;
+        }
+
+        UCS_STATIC_BITMAP_OR_INPLACE(&tl_bitmap, dev_tl_bitmap);
+    }
+
+    /* Every named device unusable is an error, not an empty address: an address
+     * with no entries would be published as if it were routable and the peer
+     * would fail to create an endpoint from it with no indication why.
+     */
+    if (UCS_STATIC_BITMAP_IS_ZERO(tl_bitmap)) {
+        ucs_error("ucp_worker_get_address_with_devices: none of the %u named"
+                  " devices has usable transport resources on worker %p",
+                  num_dev_names, worker);
+        status = UCS_ERR_NO_DEVICE;
+        goto out;
+    }
+
+    status = ucp_worker_address_pack_bitmap(worker, &tl_bitmap,
+                                            address_length_p,
+                                            (void**)address_p);
+
+out:
+    UCP_WORKER_THREAD_CS_EXIT_CONDITIONAL(worker);
+    return status;
+}
+
+ucs_status_t ucp_worker_exclude_device(ucp_worker_h worker, const char *dev_name)
+{
+    ucp_context_h context = worker->context;
+    ucp_tl_bitmap_t dev_tl_bitmap;
+    ucs_status_t status;
+
+    UCP_WORKER_THREAD_CS_ENTER_CONDITIONAL(worker);
+
+    ucp_context_dev_tl_bitmap(context, dev_name, &dev_tl_bitmap);
+    if (UCS_STATIC_BITMAP_IS_ZERO(dev_tl_bitmap)) {
+        ucs_diag("ucp_worker_exclude_device: '%s' has no resources to exclude",
+                 dev_name);
+        status = UCS_ERR_NO_ELEM;
+        goto out;
+    }
+
+    /* Recorded in a dedicated mask that lane selection intersects, NOT by
+     * clearing context->tl_bitmap. That bitmap is also the index map for
+     * worker->ifaces (ucp_worker_iface does
+     * ifaces[POPCOUNT_UPTO_INDEX(tl_bitmap, rsc_index)]), so clearing a bit
+     * shifts every later iface index -- which aborts on the assertion there,
+     * and would silently mis-resolve ifaces without it.
+     *
+     * The effect is the same where it counts: selection stops offering the
+     * device, including for the aux/UD lane UCX picks for wireup, which is the
+     * case that motivated this.
+     *
+     * Withdrawing the device from a published address is not enough on its own:
+     * that stops peers writing to it, but this worker still picks it for its own
+     * outbound wireup, because IB port state is cached at device init and a
+     * later port death still looks ACTIVE to selection. Observed as
+     * ibv_create_ah() failing with ENODATA on the dead device, forever, so a
+     * peer's freshly built endpoint could never finish wiring up.
+     *
+     * Only ever clears bits, never sets them, so a concurrent selection either
+     * sees the device or does not -- it cannot see a half-built mask. Not
+     * reversible: bringing a device back needs a new context, which is the same
+     * constraint UCX_NET_DEVICES already has.
+     */
+    UCS_STATIC_BITMAP_OR_INPLACE(&context->excluded_tl_bitmap, dev_tl_bitmap);
+    ucs_info("ucp_worker_exclude_device: '%s' removed from lane selection on"
+             " worker %p", dev_name, worker);
+    status = UCS_OK;
+
+out:
+    UCP_WORKER_THREAD_CS_EXIT_CONDITIONAL(worker);
     return status;
 }
 

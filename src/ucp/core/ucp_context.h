@@ -173,6 +173,9 @@ typedef struct ucp_context_config {
     /** Enable cm wireup message exchange to select the best transports
      *  for all lanes after cm phase is done */
     int                                    cm_use_all_devices;
+    /** Confine an endpoint built from a peer's wireup request to the device
+     *  that request arrived on, when the peer's address names one device */
+    int                                    wireup_pin_to_arrival_device;
     /** Maximal number of pending connection requests for a listener */
     size_t                                 listener_backlog;
     /** Enable new protocol selection logic */
@@ -440,6 +443,12 @@ typedef struct ucp_context {
     ucp_tl_bitmap_t               tl_bitmap;  /* Cached map of tl resources used by workers.
                                                * Not all resources may be used if unified
                                                * mode is enabled. */
+    /* Resources retired at runtime (ucp_worker_exclude_device). Kept separate
+     * from tl_bitmap on purpose: that one is also the index map for
+     * worker->ifaces (see ucp_worker_iface), so clearing a bit there shifts
+     * every later iface index and corrupts the lookup. This mask only filters
+     * selection. */
+    ucp_tl_bitmap_t               excluded_tl_bitmap;
     ucp_rsc_index_t               num_tls;    /* Number of resources in the array */
     ucp_proto_id_mask_t           proto_bitmap;  /* Enabled protocols */
 
@@ -531,6 +540,10 @@ typedef struct ucp_am_handler {
     ucp_am_tracer_t               tracer;
     uint32_t                      flags;
     uct_am_callback_t             proxy_cb;
+    /* Register with the ucp_worker_iface_t the message arrived on rather
+       than with the worker, for a handler whose answer depends on the
+       arrival port */
+    int                           iface_arg;
 } ucp_am_handler_t;
 
 typedef struct ucp_tl_iface_atomic_flags {
@@ -556,13 +569,15 @@ typedef struct ucp_tl_iface_atomic_flags {
 /*
  * Define UCP active message handler helper macro.
  */
-#define _UCP_DEFINE_AM(_features, _id, _cb, _tracer, _flags, _proxy) \
+#define _UCP_DEFINE_AM(_features, _id, _cb, _tracer, _flags, _proxy, \
+                       _iface_arg) \
     ucp_am_handler_t ucp_am_handler_##_id  = { \
-        .features = _features, \
-        .cb       = _cb, \
-        .tracer   = _tracer, \
-        .flags    = _flags, \
-        .proxy_cb = _proxy \
+        .features  = _features, \
+        .cb        = _cb, \
+        .tracer    = _tracer, \
+        .flags     = _flags, \
+        .proxy_cb  = _proxy, \
+        .iface_arg = _iface_arg \
     }
 
 
@@ -570,7 +585,16 @@ typedef struct ucp_tl_iface_atomic_flags {
  * Define UCP active message handler.
  */
 #define UCP_DEFINE_AM(_features, _id, _cb, _tracer, _flags) \
-    _UCP_DEFINE_AM(_features, _id, _cb, _tracer, _flags, NULL)
+    _UCP_DEFINE_AM(_features, _id, _cb, _tracer, _flags, NULL, 0)
+
+
+/**
+ * Defines UCP active message handler whose callback argument is the
+ * @ref ucp_worker_iface_t the message arrived on, which is the only place the
+ * arrival port is still known.
+ */
+#define UCP_DEFINE_AM_WITH_IFACE(_features, _id, _cb, _tracer, _flags) \
+    _UCP_DEFINE_AM(_features, _id, _cb, _tracer, _flags, NULL, 1)
 
 
 /**
@@ -590,7 +614,7 @@ typedef struct ucp_tl_iface_atomic_flags {
     } \
     \
     _UCP_DEFINE_AM(_features, _id, _cb, _tracer, _flags, \
-                   ucp_am_##_id##_counting_proxy)
+                   ucp_am_##_id##_counting_proxy, 0)
 
 
 #define UCP_CHECK_PARAM_NON_NULL(_param, _status, _action) \

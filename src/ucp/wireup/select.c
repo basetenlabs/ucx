@@ -87,6 +87,8 @@ typedef struct {
     ucp_ep_h                      ep;               /* UCP Endpoint */
     unsigned                      ep_init_flags;    /* Endpoint init flags */
     ucp_tl_bitmap_t               tl_bitmap;        /* TLs bitmap which can be selected */
+    /* Peer devices which can be selected, restricted by the endpoint's pin */
+    uint64_t                      remote_dev_bitmap;
     const ucp_unpacked_address_t  *address;         /* Remote addresses */
     int                           allow_am;         /* Shows whether emulation over AM
                                                      * is allowed or not for RMA/AMO */
@@ -477,6 +479,15 @@ static UCS_F_NOINLINE ucs_status_t ucp_wireup_select_transport(
     tls_info[0]  = '\0';
     UCS_STATIC_BITMAP_AND_INPLACE(&tl_bitmap, select_params->tl_bitmap);
     UCS_STATIC_BITMAP_AND_INPLACE(&tl_bitmap, context->tl_bitmap);
+    /* Devices retired at runtime. Selection is the only place this needs to
+     * apply: the resources still exist and stay addressable, they are just no
+     * longer candidates -- including for the aux/UD lane used by wireup, which
+     * is the case that matters when a port dies under a live worker. */
+    UCS_STATIC_BITMAP_AND_INPLACE(
+            &tl_bitmap, UCS_STATIC_BITMAP_NOT(context->excluded_tl_bitmap));
+    /* Every caller's remote device set narrows further to the peer device this
+       endpoint was pinned to, so no selection path can widen past it */
+    remote_dev_bitmap &= select_params->remote_dev_bitmap;
     show_error   = (select_params->show_error && show_error);
 
     /* Check which remote addresses satisfy the criteria */
@@ -795,6 +806,48 @@ ucp_wireup_path_index_is_equal(unsigned path_index1, unsigned path_index2)
            (path_index1 == path_index2);
 }
 
+/* Whether the peer's address entry can address one more p2p lane of this
+ * endpoint. Each p2p lane consumes one ep address of the entry it selected, and
+ * `ucp_wireup_match_p2p_lanes` maps the two one to one; unrestricted selection
+ * spreads its lanes over entries and never exhausts one, while an endpoint
+ * confined to a single peer device puts every lane on the same entry. */
+static int
+ucp_wireup_entry_can_address(const ucp_wireup_select_params_t *select_params,
+                             const ucp_wireup_select_context_t *select_ctx,
+                             const ucp_wireup_select_info_t *select_info)
+{
+    ucp_worker_h worker  = select_params->ep->worker;
+    int has_cm_lane      = ucp_ep_has_cm_lane(select_params->ep);
+    unsigned taken       = 0;
+    const ucp_wireup_lane_desc_t *lane_desc;
+    const ucp_address_entry_t *ae;
+
+    if (!ucp_wireup_connect_p2p(worker, select_info->rsc_index, has_cm_lane)) {
+        return 1;
+    }
+
+    for (lane_desc = select_ctx->lane_descs;
+         lane_desc < select_ctx->lane_descs + select_ctx->num_lanes;
+         ++lane_desc) {
+        if ((lane_desc->addr_index == select_info->addr_index) &&
+            ucp_wireup_connect_p2p(worker, lane_desc->rsc_index, has_cm_lane)) {
+            ++taken;
+        }
+    }
+
+    ae = &select_params->address->address_list[select_info->addr_index];
+    /* An entry packing no ep address is the initiator's view of a peer: ep
+     * addresses ride a wireup request from an endpoint that exists, so there is
+     * nothing to exhaust yet and the mapping is checked on the re-selection
+     * that request drives. */
+    if (ae->num_ep_addrs == 0) {
+        return 1;
+    }
+
+    return taken < ae->num_ep_addrs;
+}
+
+
 static UCS_F_NOINLINE ucs_status_t ucp_wireup_add_lane_desc(
         const ucp_wireup_select_params_t *select_params,
         const ucp_wireup_select_info_t *select_info,
@@ -857,6 +910,18 @@ static UCS_F_NOINLINE ucs_status_t ucp_wireup_add_lane_desc(
         ucs_log(log_level, "cannot add %s lane - reached limit (%d)",
                 ucp_lane_type_info[lane_type].short_name,
                 select_ctx->num_lanes);
+        return UCS_ERR_EXCEEDS_LIMIT;
+    }
+
+    if (!ucp_wireup_entry_can_address(select_params, select_ctx, select_info)) {
+        log_level = show_error ? UCS_LOG_LEVEL_ERROR : UCS_LOG_LEVEL_DEBUG;
+        ucs_log(log_level,
+                "cannot add %s lane - addr[%u] packs %u ep addresses and every "
+                "one is taken by a p2p lane of this endpoint",
+                ucp_lane_type_info[lane_type].short_name,
+                select_info->addr_index,
+                select_params->address->address_list[select_info->addr_index]
+                        .num_ep_addrs);
         return UCS_ERR_EXCEEDS_LIMIT;
     }
 
@@ -2064,7 +2129,7 @@ ucp_wireup_add_am_bw_lanes(const ucp_wireup_select_params_t *select_params,
     }
 
     bw_info.local_dev_bitmap  = UINT64_MAX;
-    bw_info.remote_dev_bitmap = UINT64_MAX;
+    bw_info.remote_dev_bitmap = select_params->remote_dev_bitmap;
     excluded_am_lane          = UCP_NULL_LANE;
 
     if (context->config.ext.proto_enable) {
@@ -2229,7 +2294,7 @@ ucp_wireup_add_rma_bw_lanes(const ucp_wireup_select_params_t *select_params,
     }
 
     bw_info.local_dev_bitmap  = UINT64_MAX;
-    bw_info.remote_dev_bitmap = UINT64_MAX;
+    bw_info.remote_dev_bitmap = select_params->remote_dev_bitmap;
 
     /* check rkey_ptr */
     if (!(ep_init_flags & UCP_EP_INIT_FLAG_MEM_TYPE) &&
@@ -2483,13 +2548,14 @@ ucp_wireup_select_params_init(ucp_wireup_select_params_t *select_params,
                               const ucp_unpacked_address_t *remote_address,
                               ucp_tl_bitmap_t tl_bitmap, int show_error)
 {
-    select_params->ep            = ep;
-    select_params->ep_init_flags = ep_init_flags;
-    select_params->tl_bitmap     = tl_bitmap;
-    select_params->address       = remote_address;
-    select_params->allow_am      =
+    select_params->ep                = ep;
+    select_params->ep_init_flags     = ep_init_flags;
+    select_params->tl_bitmap         = tl_bitmap;
+    select_params->remote_dev_bitmap = ucp_ep_dev_restriction_remote(ep);
+    select_params->address           = remote_address;
+    select_params->allow_am          =
             ucp_wireup_allow_am_emulation_layer(ep_init_flags);
-    select_params->show_error    = show_error;
+    select_params->show_error        = show_error;
 }
 
 static double
@@ -2622,7 +2688,7 @@ ucp_wireup_add_device_lanes(const ucp_wireup_select_params_t *select_params,
                                  UCT_IFACE_FLAG_DEVICE_EP, 0);
 
     bw_info.local_dev_bitmap          = UINT64_MAX;
-    bw_info.remote_dev_bitmap         = UINT64_MAX;
+    bw_info.remote_dev_bitmap         = select_params->remote_dev_bitmap;
     bw_info.criteria.title            = "device remote memory access";
     bw_info.criteria.lane_type        = UCP_LANE_TYPE_DEVICE;
     bw_info.criteria.local_cmpt_flags = 0;
