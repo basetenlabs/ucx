@@ -273,11 +273,14 @@ ucp_wireup_ep_connect_aux(ucp_wireup_ep_t *wireup_ep, unsigned ep_init_flags,
     uct_ep_h uct_ep;
 
     /* select an auxiliary transport which would be used to pass connection
-     * establishment messages.
+     * establishment messages. It has to stay inside the endpoint's device pin:
+     * the request it carries announces the endpoint's lane resources plus this
+     * one, so an auxiliary on another device hands the peer a second device to
+     * select over, and the reply then arrives on a port no lane is on.
      */
-    status = ucp_wireup_select_aux_transport(ucp_ep, ep_init_flags,
-                                             ucp_tl_bitmap_max, remote_address,
-                                             &select_info);
+    status = ucp_wireup_select_aux_transport(
+            ucp_ep, ep_init_flags, *ucp_ep_dev_restriction_tls(ucp_ep),
+            remote_address, &select_info);
     if (status != UCS_OK) {
         return status;
     }

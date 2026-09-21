@@ -9,9 +9,11 @@
 #endif
 
 #include "address.h"
+#include "wireup.h"
 #include "wireup_ep.h"
 
 #include <ucp/core/ucp_worker.h>
+#include <ucp/core/ucp_worker.inl>
 #include <ucp/core/ucp_ep.inl>
 #include <ucs/arch/bitops.h>
 #include <ucs/datastruct/array.h>
@@ -1647,6 +1649,84 @@ ucp_address_adjust_unpacked_md_index(ucp_unpacked_address_t *unpacked_address)
         unpacked_address->address_list[i].md_index &=
                 ~UCP_ADDRESS_FLAG_MD_INDEX_LEGACY_BITS;
     }
+}
+
+static uint64_t
+ucp_address_entry_reachable_devs(ucp_worker_h worker,
+                                 const ucp_address_entry_t *ae)
+{
+    ucp_context_h context     = worker->context;
+    uint64_t reachable_devs   = 0;
+    ucp_tl_bitmap_t tl_bitmap = context->tl_bitmap;
+    ucp_rsc_index_t dev_index;
+    ucp_rsc_index_t rsc_index;
+
+    UCS_STATIC_BITMAP_AND_INPLACE(
+            &tl_bitmap, UCS_STATIC_BITMAP_NOT(context->excluded_tl_bitmap));
+
+    UCS_STATIC_BITMAP_FOR_EACH_BIT(rsc_index, &tl_bitmap) {
+        dev_index = context->tl_rscs[rsc_index].dev_index;
+        /* The reported set is a 64-bit mask, matching the peer device mask
+           lane selection uses, so a device beyond that is left out */
+        if ((dev_index < 64) &&
+            ucp_wireup_worker_is_reachable(worker, 0, rsc_index, ae, NULL, 0)) {
+            reachable_devs |= UCS_BIT(dev_index);
+        }
+    }
+
+    return reachable_devs;
+}
+
+ucs_status_t ucp_address_query_devices(ucp_worker_h worker,
+                                       const ucp_address_t *address,
+                                       ucp_address_device_attr_t *entries,
+                                       unsigned *num_entries_p)
+{
+    unsigned max_entries = *num_entries_p;
+    unsigned num_entries = 0;
+    ucp_unpacked_address_t unpacked_address;
+    const ucp_address_entry_t *ae;
+    ucp_address_device_attr_t *entry;
+    ucs_status_t status;
+
+    status = ucp_address_unpack(worker, address,
+                                ucp_worker_default_address_pack_flags(worker),
+                                &unpacked_address);
+    if (status != UCS_OK) {
+        return status;
+    }
+
+    ucp_unpacked_address_for_each(ae, &unpacked_address) {
+        ++num_entries;
+        if ((entries == NULL) || (num_entries > max_entries)) {
+            continue;
+        }
+
+        entry = &entries[num_entries - 1];
+
+        entry->dev_index    = ae->dev_index;
+        entry->sys_dev      = ae->sys_dev;
+        entry->num_paths    = ae->dev_num_paths;
+        entry->tl_name_csum = ae->tl_name_csum;
+        entry->dev_addr     = ae->dev_addr;
+        entry->dev_addr_len = ae->dev_addr_len;
+        entry->bandwidth    = ae->iface_attr.bandwidth;
+        entry->latency      = ae->iface_attr.lat_ovh;
+        entry->overhead     = ae->iface_attr.overhead;
+        entry->seg_size     = ae->iface_attr.seg_size;
+        entry->flags        = ae->iface_attr.flags;
+
+        entry->reachable_dev_bitmap =
+                ucp_address_entry_reachable_devs(worker, ae);
+    }
+
+    /* The entries point into the caller's address blob, not into the list, so
+       the list is released here and the caller has nothing to release */
+    ucs_free(unpacked_address.address_list);
+
+    *num_entries_p = num_entries;
+    return ((entries == NULL) || (num_entries <= max_entries)) ?
+           UCS_OK : UCS_ERR_BUFFER_TOO_SMALL;
 }
 
 ucs_status_t ucp_address_unpack(ucp_worker_t *worker, const void *buffer,
