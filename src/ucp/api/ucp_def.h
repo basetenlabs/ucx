@@ -707,6 +707,24 @@ typedef ucs_status_t (*ucp_am_recv_callback_t)(void *arg, const void *header,
  * The structure defines the parameters that are used for the
  * UCP endpoint tuning during the UCP ep @ref ucp_ep_create "creation".
  */
+/**
+ * @ingroup UCP_ENDPOINT
+ * @brief One path between two workers: a local device and a peer device.
+ *
+ * Both indices come from the two device queries, and the remote one is valid
+ * inside the very address blob passed to @ref ucp_ep_create: the same peer
+ * device carries a different index in that peer's own
+ * @ref ucp_worker_query_devices listing.
+ */
+typedef struct ucp_ep_path {
+    /** Local device, by @ref ucp_worker_device_attr_t::dev_index */
+    unsigned local_dev_index;
+    /** Peer device, by @ref ucp_address_device_attr_t::dev_index for the
+        address this endpoint is created from */
+    unsigned remote_dev_index;
+} ucp_ep_path_t;
+
+
 typedef struct ucp_ep_params {
     /**
      * Mask of valid fields in this structure, using bits from
@@ -807,6 +825,23 @@ typedef struct ucp_ep_params {
      * another device, since a silent fallback would defeat the purpose.
      */
     const char              *local_device;
+
+    /**
+     * The one path this endpoint's lanes take: both ends, named together.
+     *
+     * Every lane of the endpoint is selected on that pair, now and on every
+     * later re-selection a peer's wireup request drives. No lane is selected
+     * elsewhere instead: where the pair affords none, endpoint creation fails
+     * with UCS_ERR_UNREACHABLE, and where the remote address carries no entry
+     * with that device index, with UCS_ERR_NO_DEVICE.
+     *
+     * This setting is optional. To enable it, the corresponding - @ref
+     * UCP_EP_PARAM_FIELD_PATH bit in the field mask must be set. It is the
+     * whole path or nothing: an application that knows only its own end names
+     * it through @ref ucp_ep_params_t::local_device instead, and then lane
+     * selection picks the peer's device as it always did.
+     */
+    ucp_ep_path_t           path;
 
 } ucp_ep_params_t;
 

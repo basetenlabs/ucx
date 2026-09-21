@@ -416,6 +416,16 @@ static ucs_config_field_t ucp_context_config_table[] = {
    "establishment is done",
    ucs_offsetof(ucp_context_config_t, cm_use_all_devices), UCS_CONFIG_TYPE_BOOL},
 
+  {"WIREUP_PIN_TO_ARRIVAL_DEVICE", "y",
+   "Confine an endpoint created for a peer's wireup request to the device the\n"
+   "request arrived on, so that the reply, the lanes and anything the peer\n"
+   "later pulls over that endpoint stay on the port pair the peer dialled.\n"
+   "Applies only when the peer's address names a single device, which is what\n"
+   "a peer that pinned its own end sends; every other endpoint selects over\n"
+   "all devices as before.",
+   ucs_offsetof(ucp_context_config_t, wireup_pin_to_arrival_device),
+   UCS_CONFIG_TYPE_BOOL},
+
   {"LISTENER_BACKLOG", "auto",
    "'auto' means that each transport would use its maximal allowed value.\n"
    "If a value larger than what a transport supports is set, the backlog value\n"

@@ -500,6 +500,23 @@ typedef struct ucp_ep_recovery_arg {
 
 
 /**
+ * Device restriction requested when the endpoint was created. It is kept on the
+ * endpoint rather than passed down the create call, because lane re-selection
+ * driven by a peer's wireup request happens long after the create call returned
+ * and has no other way to learn that this endpoint is pinned.
+ */
+typedef struct ucp_ep_dev_restriction {
+    /* Local transport resources the lanes may be selected from. Equals
+       ucp_tl_bitmap_max unless UCP_EP_PARAM_FIELD_LOCAL_DEVICE was given */
+    ucp_tl_bitmap_t               tls;
+    /* Peer devices the lanes may connect to, by the device index the peer's
+       packed address uses. Equals UINT64_MAX unless
+       UCP_EP_PARAM_FIELD_PATH was given */
+    uint64_t                      remote_devs;
+} ucp_ep_dev_restriction_t;
+
+
+/**
  * Endpoint extension
  */
 typedef struct ucp_ep_ext {
@@ -563,6 +580,12 @@ typedef struct ucp_ep_ext {
      * Map of system devices that require a flush operation
      */
     ucp_sys_dev_map_t             flush_sys_dev_map;
+
+    /**
+     * Device restriction this endpoint was created with, honored again by every
+     * later lane selection
+     */
+    ucp_ep_dev_restriction_t      dev_restriction;
 } ucp_ep_ext_t;
 
 
@@ -723,9 +746,36 @@ ucs_status_t
 ucp_ep_config_err_mode_check_mismatch(ucp_ep_h ep,
                                       ucp_err_handling_mode_t err_mode);
 
+/* Build the record from the local bitmap the caller already resolved plus the
+ * remote device in @a params, failing with UCS_ERR_NO_DEVICE if
+ * @a remote_address carries no entry with that device index */
+ucs_status_t
+ucp_ep_dev_restriction_init(ucp_ep_dev_restriction_t *restriction,
+                            const ucp_ep_params_t *params,
+                            const ucp_tl_bitmap_t *local_tl_bitmap,
+                            const ucp_unpacked_address_t *remote_address);
+
+/* Build the record from the device a peer's wireup request arrived on, leaving
+ * the remote half unrestricted. Fails with UCS_ERR_NO_DEVICE if that device
+ * carries no usable non-auxiliary resource, in which case the caller leaves the
+ * endpoint unrestricted rather than giving it no lane at all */
+ucs_status_t
+ucp_ep_dev_restriction_from_iface(ucp_worker_h worker,
+                                  ucp_rsc_index_t arrival_rsc_index,
+                                  ucp_ep_dev_restriction_t *restriction);
+
+void ucp_ep_dev_restriction_store(ucp_ep_h ep,
+                                  const ucp_ep_dev_restriction_t *restriction);
+
+const ucp_tl_bitmap_t *ucp_ep_dev_restriction_tls(ucp_ep_h ep);
+
+uint64_t ucp_ep_dev_restriction_remote(ucp_ep_h ep);
+
+/* @a restriction is optional: NULL creates an endpoint with no device pin */
 ucs_status_t
 ucp_ep_create_to_worker_addr(ucp_worker_h worker,
                              const ucp_tl_bitmap_t *local_tl_bitmap,
+                             const ucp_ep_dev_restriction_t *restriction,
                              const ucp_unpacked_address_t *remote_address,
                              unsigned ep_init_flags, const char *message,
                              unsigned *addr_indices, ucp_ep_h *ep_p);
