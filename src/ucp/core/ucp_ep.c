@@ -311,7 +311,8 @@ static int ucp_ep_shall_use_indirect_id(ucp_context_h context,
                                         unsigned ep_init_flags)
 {
     return !(ep_init_flags & UCP_EP_INIT_FLAG_INTERNAL) &&
-           ((context->config.ext.proto_indirect_id == UCS_CONFIG_ON) ||
+           ((ep_init_flags & UCP_EP_INIT_ERR_MODE_FAILOVER) ||
+            (context->config.ext.proto_indirect_id == UCS_CONFIG_ON) ||
             ((context->config.ext.proto_indirect_id == UCS_CONFIG_AUTO) &&
              (ep_init_flags & UCP_EP_INIT_ERR_MODE_FAILOVER_MASK)));
 }
@@ -1809,7 +1810,7 @@ ucp_ep_set_failed(ucp_ep_h ucp_ep, ucp_lane_index_t lane, ucs_status_t status)
 
     if (ucp_ep->flags & UCP_EP_FLAG_USED) {
         if (ucp_ep->flags & UCP_EP_FLAG_CLOSED) {
-            if (ep_ext->close_req != NULL) {
+            if (ucp_ep_has_cm_lane(ucp_ep) && (ep_ext->close_req != NULL)) {
                 /* Promote close operation to CANCEL in case of transport error,
                  * since the disconnect event may never arrive. */
                 close_req                        = ep_ext->close_req;
@@ -2537,8 +2538,8 @@ int ucp_ep_recovery_progress(ucp_ep_h ep)
         goto done;
     }
 
-    if (ep->flags & UCP_EP_FLAG_FAILED) {
-        /* Endpoint was declared fully failed elsewhere; nothing more to do. */
+    if (ep->flags & (UCP_EP_FLAG_FAILED | UCP_EP_FLAG_CLOSED)) {
+        /* Endpoint failure or close owns lane teardown from this point. */
         ret = 1;
         goto done;
     }
@@ -2706,7 +2707,8 @@ void ucp_ep_set_lanes_failed(ucp_ep_h ucp_ep, ucp_lane_map_t lanes,
         return;
     }
 
-    if (ucp_ep_err_mode_eq(ucp_ep, UCP_ERR_HANDLING_MODE_FAILOVER) &&
+    if (!(ucp_ep->flags & UCP_EP_FLAG_CLOSED) &&
+        ucp_ep_err_mode_eq(ucp_ep, UCP_ERR_HANDLING_MODE_FAILOVER) &&
         (lanes != 0) &&
          /* sockaddr is not supported for failover mode */
         cm_lane == UCP_NULL_LANE) {
@@ -2735,8 +2737,6 @@ void ucp_ep_set_lanes_failed_schedule(ucp_ep_h ucp_ep, ucp_lane_map_t lanes,
     ucp_worker_h worker = ucp_ep->worker;
     ucp_ep_set_lanes_failed_arg_t *set_ep_failed_arg;
 
-    UCP_WORKER_THREAD_CS_CHECK_IS_BLOCKED(worker);
-
     set_ep_failed_arg = ucs_malloc(sizeof(*set_ep_failed_arg),
                                    "set_ep_failed_arg");
     if (set_ep_failed_arg == NULL) {
@@ -2748,8 +2748,10 @@ void ucp_ep_set_lanes_failed_schedule(ucp_ep_h ucp_ep, ucp_lane_map_t lanes,
     set_ep_failed_arg->lanes  = lanes;
     set_ep_failed_arg->status = status;
 
+    UCS_ASYNC_BLOCK(&worker->async);
     ucs_callbackq_add_oneshot(&worker->uct->progress_q, ucp_ep,
                               ucp_ep_set_lanes_failed_progress, set_ep_failed_arg);
+    UCS_ASYNC_UNBLOCK(&worker->async);
 
     /* If the worker supports the UCP_FEATURE_WAKEUP feature, signal the user so
      * that he can wake-up on this event */

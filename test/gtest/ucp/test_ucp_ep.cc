@@ -5,10 +5,12 @@
  */
 
 #include "ucp_test.h"
+#include <common/test_helpers.h>
 #include <ucp/core/ucp_context.h>
 
 extern "C" {
 #include <ucp/core/ucp_ep.inl>
+#include <ucp/wireup/wireup.h>
 }
 
 class test_ucp_ep : public ucp_test {
@@ -99,7 +101,61 @@ UCS_TEST_P(test_ucp_ep, ucp_query_transport)
 UCP_INSTANTIATE_TEST_CASE(test_ucp_ep);
 
 class test_ucp_ep_recovery : public test_ucp_ep {
+protected:
+    ucp_ep_params_t get_ep_params() override
+    {
+        ucp_ep_params_t params = test_ucp_ep::get_ep_params();
+
+        params.field_mask    |= UCP_EP_PARAM_FIELD_ERR_HANDLING_MODE |
+                                UCP_EP_PARAM_FIELD_ERR_HANDLER;
+        params.err_mode       = UCP_ERR_HANDLING_MODE_FAILOVER;
+        params.err_handler.cb = [](void *, ucp_ep_h, ucs_status_t) {};
+        return params;
+    }
+
+    void wait_for_failure(ucp_ep_h ep)
+    {
+        wait_for_cond([ep]() {
+            return ep->flags & UCP_EP_FLAG_FAILED;
+        }, [this]() {
+            short_progress_loop();
+        });
+        EXPECT_TRUE(ep->flags & UCP_EP_FLAG_FAILED);
+    }
 };
+
+UCS_TEST_P(test_ucp_ep_recovery, recovery_during_close,
+           "PROTO_INDIRECT_ID=n")
+{
+    ucp_ep_h closed_ep = sender().ep();
+    ucp_ep_h peer_ep;
+    ucp_lane_map_t lane_map;
+
+    EXPECT_TRUE(closed_ep->flags & UCP_EP_FLAG_INDIRECT_ID);
+    receiver().connect(&sender(), get_ep_params());
+    flush_workers();
+    peer_ep  = receiver().ep();
+    lane_map = UCS_BIT(ucp_ep_config(peer_ep)->key.am_lane);
+
+    {
+        ucs::scoped_async_lock lock(closed_ep->worker->async);
+        ASSERT_UCS_OK(ucp_ep_recovery_arm(closed_ep));
+        ucp_ep_update_flags(closed_ep, UCP_EP_FLAG_CLOSED, 0);
+        EXPECT_EQ(1, ucp_ep_recovery_progress(closed_ep));
+    }
+
+    ucp_wireup_send_lanes_addr_msg(peer_ep,
+                                   UCP_WIREUP_MSG_LANES_ADDR_REQUEST, lane_map,
+                                   lane_map);
+    wait_for_failure(peer_ep);
+
+    ucp_ep_set_lanes_failed_schedule(closed_ep, lane_map,
+                                     UCS_ERR_CONNECTION_RESET);
+    wait_for_failure(closed_ep);
+
+    ucs::scoped_async_lock lock(closed_ep->worker->async);
+    ucp_ep_update_flags(closed_ep, 0, UCP_EP_FLAG_CLOSED);
+}
 
 UCS_TEST_P(test_ucp_ep_recovery, exhausted_stays_idle)
 {
@@ -117,4 +173,4 @@ UCS_TEST_P(test_ucp_ep_recovery, exhausted_stays_idle)
     key->lanes[lane].lane_types = lane_types;
 }
 
-UCP_INSTANTIATE_TEST_CASE_TLS(test_ucp_ep_recovery, self, "self")
+UCP_INSTANTIATE_TEST_CASE_TLS(test_ucp_ep_recovery, tcp, "tcp")
