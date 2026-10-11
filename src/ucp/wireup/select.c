@@ -822,14 +822,19 @@ ucp_wireup_entry_can_address(const ucp_wireup_select_params_t *select_params,
     const ucp_wireup_lane_desc_t *lane_desc;
     const ucp_address_entry_t *ae;
 
-    if (!ucp_wireup_connect_p2p(worker, select_info->rsc_index, has_cm_lane)) {
+    /* A CM lane has no transport resource and no address entry
+     * (rsc_index == UCP_NULL_RESOURCE, addr_index == UINT_MAX), so it takes no
+     * ep address. */
+    if ((select_info->rsc_index == UCP_NULL_RESOURCE) ||
+        !ucp_wireup_connect_p2p(worker, select_info->rsc_index, has_cm_lane)) {
         return 1;
     }
 
     for (lane_desc = select_ctx->lane_descs;
          lane_desc < select_ctx->lane_descs + select_ctx->num_lanes;
          ++lane_desc) {
-        if ((lane_desc->addr_index == select_info->addr_index) &&
+        if ((lane_desc->rsc_index != UCP_NULL_RESOURCE) &&
+            (lane_desc->addr_index == select_info->addr_index) &&
             ucp_wireup_connect_p2p(worker, lane_desc->rsc_index, has_cm_lane)) {
             ++taken;
         }
