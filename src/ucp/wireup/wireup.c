@@ -889,6 +889,16 @@ ucp_wireup_process_request(ucp_worker_h worker, ucp_ep_h ep,
     return;
 
 err_set_ep_failed:
+    if (ep->cfg_index == UCP_WORKER_CFG_INDEX_NULL) {
+        /* Created above and never given lanes: there is nothing to fail, and
+           failing it reads the configuration it does not have. The peer's
+           endpoint gets no reply and fails on its own side */
+        ucs_assert(ep_created);
+        ucp_ep_match_remove_ep(worker, ep);
+        ucp_ep_delete(ep);
+        return;
+    }
+
     ucp_ep_set_lanes_failed_schedule(ep, 0, status);
 }
 

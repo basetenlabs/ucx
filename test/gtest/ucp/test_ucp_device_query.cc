@@ -542,3 +542,90 @@ UCS_TEST_P(test_ucp_device_query, multi_device_address_is_left_alone)
 }
 
 UCP_INSTANTIATE_TEST_CASE(test_ucp_device_query)
+
+
+/* An RDMA device beside tcp on its own netdev: one device index, two names */
+class test_ucp_device_query_rdma_tcp : public test_ucp_device_query {
+protected:
+    static void ignore_error(void *arg, ucp_ep_h ep, ucs_status_t status)
+    {
+    }
+};
+
+UCS_TEST_P(test_ucp_device_query_rdma_tcp, arrival_pin_with_no_reachable_lane)
+{
+    /* One device index can carry several device names -- tcp on a NIC's netdev
+       shares the RDMA port's sys_device -- and retiring the RDMA name leaves the
+       other one in the arrival pin. A request that arrives on the retired port
+       then pins its new endpoint to a transport the peer's address does not
+       carry, so no lane can be selected. The receiver must drop the endpoint it
+       never configured, not fail it as one that has lanes. */
+    ucp_context_h context = receiver().ucph();
+    const char *retired   = NULL;
+    ucp_rsc_index_t tl_idx, other_idx;
+
+    UCS_STATIC_BITMAP_FOR_EACH_BIT(tl_idx, &context->tl_bitmap) {
+        if (!(context->tl_rscs[tl_idx].flags & UCP_TL_RSC_FLAG_AUX)) {
+            continue;
+        }
+
+        UCS_STATIC_BITMAP_FOR_EACH_BIT(other_idx, &context->tl_bitmap) {
+            if ((context->tl_rscs[other_idx].dev_index ==
+                 context->tl_rscs[tl_idx].dev_index) &&
+                strcmp(context->tl_rscs[other_idx].tl_rsc.dev_name,
+                       context->tl_rscs[tl_idx].tl_rsc.dev_name) &&
+                !(context->tl_rscs[other_idx].flags & UCP_TL_RSC_FLAG_AUX)) {
+                retired = context->tl_rscs[tl_idx].tl_rsc.dev_name;
+                break;
+            }
+        }
+
+        if (retired != NULL) {
+            break;
+        }
+    }
+
+    if (retired == NULL) {
+        UCS_TEST_SKIP_R("no device index carries a second device name");
+    }
+
+    UCS_TEST_MESSAGE << "retiring '" << retired << "'";
+
+    /* Retired after its address is packed: the address still names it, which
+       is what a peer holding an address from before the retirement aims at */
+    ucp_address_t *address;
+    size_t length;
+    ASSERT_UCS_OK(ucp_worker_get_address_with_devices(receiver().worker(),
+                                                      &retired, 1, &address,
+                                                      &length));
+    ASSERT_UCS_OK(ucp_worker_exclude_device(receiver().worker(), retired));
+
+    ucp_ep_params_t ep_params;
+    ep_params.field_mask      = UCP_EP_PARAM_FIELD_REMOTE_ADDRESS |
+                                UCP_EP_PARAM_FIELD_LOCAL_DEVICE |
+                                UCP_EP_PARAM_FIELD_ERR_HANDLING_MODE |
+                                UCP_EP_PARAM_FIELD_ERR_HANDLER;
+    ep_params.address         = address;
+    ep_params.local_device    = retired;
+    /* The request is never answered, so only an endpoint that handles errors
+       can be closed */
+    ep_params.err_mode        = UCP_ERR_HANDLING_MODE_PEER;
+    ep_params.err_handler.cb  = ignore_error;
+    ep_params.err_handler.arg = NULL;
+
+    ucp_ep_h ep;
+    {
+        scoped_log_handler wrap_err(wrap_errors_logger);
+        ASSERT_UCS_OK(ucp_ep_create(sender().worker(), &ep_params, &ep));
+        for (unsigned i = 0; i < 10; ++i) {
+            short_progress_loop();
+        }
+    }
+
+    EXPECT_EQ(NULL, peer_endpoint(receiver().worker()));
+
+    close_ep(ep);
+    ucp_worker_release_address(receiver().worker(), address);
+}
+
+UCP_INSTANTIATE_TEST_CASE_TLS(test_ucp_device_query_rdma_tcp, rc_tcp, "rc,tcp")
