@@ -3035,6 +3035,39 @@ ucs_status_ptr_t ucp_ep_close_nbx(ucp_ep_h ep,
 
 
 /**
+ * @ingroup UCP_ENDPOINT
+ *
+ * @brief Force-close an endpoint known only by its handle, if the worker still has it.
+ *
+ * For an endpoint a peer's wireup created, which the application holds only as
+ * a handle (an Active Message's reply endpoint) and never created itself. UCX
+ * destroys such an endpoint on its own once it detects the peer failed, so the
+ * handle may no longer name an endpoint, and @ref ucp_ep_close_nbx on it would
+ * read freed memory. This looks the handle up among the worker's endpoints and
+ * closes only one it finds, discarding its lanes: nothing the peer puts
+ * afterwards reaches this worker's memory through them. The handle is not
+ * dereferenced unless found.
+ *
+ * @param [in]  worker  Worker the endpoint was created on.
+ * @param [in]  ep      Endpoint handle; need not name a live endpoint.
+ * @param [in]  param   As for @ref ucp_ep_close_nbx; @ref UCP_EP_CLOSE_FLAG_FORCE
+ *                      is implied.
+ *
+ * @return NULL                 - The endpoint is closed.
+ * @return UCS_PTR_IS_ERR(_ptr) - UCS_ERR_NO_ELEM when the handle is not an
+ *                                endpoint of the worker (destroyed already, its
+ *                                lanes with it), UCS_ERR_NOT_CONNECTED when it
+ *                                is closed or failed already, otherwise the
+ *                                status the closure failed with.
+ * @return otherwise            - A request tracking the closure, as for
+ *                                @ref ucp_ep_close_nbx.
+ */
+ucs_status_ptr_t ucp_worker_ep_close_if_alive_nbx(ucp_worker_h worker,
+                                                  ucp_ep_h ep,
+                                                  const ucp_request_param_t *param);
+
+
+/**
  * @ingroup UCP_WORKER
  *
  * @brief Reject an incoming connection request.
