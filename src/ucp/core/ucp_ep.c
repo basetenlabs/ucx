@@ -2956,6 +2956,38 @@ out:
     return request;
 }
 
+ucs_status_ptr_t ucp_worker_ep_close_if_alive_nbx(ucp_worker_h worker,
+                                                  ucp_ep_h ep,
+                                                  const ucp_request_param_t *param)
+{
+    ucs_status_ptr_t request = UCS_STATUS_PTR(UCS_ERR_NO_ELEM);
+    ucp_request_param_t force_param;
+    ucp_ep_ext_t *ep_ext;
+
+    force_param               = *param;
+    force_param.flags         = ucp_request_param_flags(param) |
+                                UCP_EP_CLOSE_FLAG_FORCE;
+    force_param.op_attr_mask |= UCP_OP_ATTR_FIELD_FLAGS;
+
+    /* The async lock is the one endpoint destruction runs under. */
+    UCS_ASYNC_BLOCK(&worker->async);
+    ucs_list_for_each(ep_ext, &worker->all_eps, ep_list) {
+        if (ep_ext->ep != ep) {
+            continue;
+        }
+
+        if (ep->flags & (UCP_EP_FLAG_CLOSED | UCP_EP_FLAG_FAILED)) {
+            request = UCS_STATUS_PTR(UCS_ERR_NOT_CONNECTED);
+        } else {
+            request = ucp_ep_close_nbx(ep, &force_param);
+        }
+        break;
+    }
+    UCS_ASYNC_UNBLOCK(&worker->async);
+
+    return request;
+}
+
 ucs_status_ptr_t ucp_disconnect_nb(ucp_ep_h ep)
 {
     return ucp_ep_close_nb(ep, UCP_EP_CLOSE_MODE_FLUSH);
