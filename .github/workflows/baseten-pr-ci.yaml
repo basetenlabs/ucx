@@ -22,10 +22,10 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             autoconf automake libtool pkg-config libnuma-dev
 
-      - name: Configure (release, CPU-only)
+      - name: Configure (release, CPU-only, no Java bindings)
         run: |
           ./autogen.sh
-          ./contrib/configure-release --without-verbs
+          ./contrib/configure-release --without-verbs --without-java
 
       - name: Build
         run: make -j"$(nproc)"
