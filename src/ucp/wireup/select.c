@@ -2342,7 +2342,8 @@ ucp_wireup_add_rma_bw_lanes(const ucp_wireup_select_params_t *select_params,
      * invalidation support to provide correct data integrity in case of error.
      */
     if ((ep_init_flags & UCP_EP_INIT_ERR_MODE_PEER_FAILURE) &&
-        ucp_context_rndv_is_enabled(context)) {
+        ucp_context_rndv_is_enabled(context) &&
+        context->config.ext.rndv_err_invalidate) {
         bw_info.criteria.local_md_flags |= UCT_MD_FLAG_INVALIDATE_RMA;
     }
 

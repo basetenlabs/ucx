@@ -128,6 +128,9 @@ typedef struct ucp_context_config {
     int                                    rndv_shm_ppln_enable;
     /** Enable error handling for rndv pipeline protocol */
     int                                    rndv_errh_ppln_enable;
+    /** Require RMA memory invalidation from the high-bandwidth RMA lanes when
+     *  peer error handling is enabled */
+    int                                    rndv_err_invalidate;
     /** Threshold for using tag matching offload capabilities. Smaller buffers
      *  will not be posted to the transport. */
     size_t                                 tm_thresh;
