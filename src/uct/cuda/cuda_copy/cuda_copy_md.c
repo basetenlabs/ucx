@@ -619,6 +619,13 @@ static void uct_cuda_copy_md_sync_memops_get_address_range(
         ucs_assert(md->config.alloc_whole_reg == UCS_CONFIG_ON);
     }
 
+    /* For multi-handle VMM, the physical allocation containing the address
+     * may not cover the whole requested range */
+    if ((base_address == 0) || /* host-located VMM reports a zero base */
+        (is_vmm && ((base_address + alloc_length) < (address + length)))) {
+        goto out_ctx_pop;
+    }
+
     mem_info->base_address = (void*)base_address;
     mem_info->alloc_length = alloc_length;
 
